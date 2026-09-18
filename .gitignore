@@ -48,6 +48,10 @@ aec_experiment/*.onnx
 # 验证用的语音探针（7 MB，可由 capture_speech.py 本机重新录制）
 aec_experiment/*.npy
 
+# ===== 本地排障产物 =====
+# hosts 等系统文件的本地备份（仅调试网络用，绝不入库）
+_hosts_backup/
+
 # ===== 系统 =====
 .DS_Store
 Thumbs.db

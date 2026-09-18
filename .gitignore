@@ -1,0 +1,54 @@
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# ===== 虚拟环境 =====
+venv/
+.venv/
+env/
+ENV/
+
+# ===== IDE / 编辑器 =====
+.vscode/
+.idea/
+.trae/
+*.swp
+*.swo
+*~
+
+# ===== 运行期生成 =====
+# 设备偏好（本机路径相关，不应入库）
+audio_router/.device_prefs.json
+# 日志与临时文件
+*.log
+*.tmp
+
+# ===== 大型二进制 / 第三方资源 =====
+# AEC 验证用的第三方模型（4.7 MB，来自 a2heng/lightweight-aec-48k，
+# 如需复现请按 aec_experiment/AEC验证报告.md 说明自行下载）
+aec_experiment/*.onnx
+# 验证用的语音探针（7 MB，可由 capture_speech.py 本机重新录制）
+aec_experiment/*.npy
+
+# ===== 系统 =====
+.DS_Store
+Thumbs.db
+desktop.ini

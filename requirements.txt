@@ -1,0 +1,11 @@
+# BTSPK 依赖清单
+# 安装：venv\Scripts\python.exe -m pip install -r requirements.txt
+
+numpy>=1.24
+scipy>=1.10
+sounddevice>=0.4.6
+
+# tkinter 是 Python 标准库的一部分，不需要 pip 安装。
+# 但如果导入报错 "No module named tkinter"，
+# 说明安装 Python 时没勾选 "tcl/tk and IDLE"，
+# 需要重新运行 Python 安装程序并勾选该组件。

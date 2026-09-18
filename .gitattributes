@@ -1,0 +1,24 @@
+# 统一换行符处理，避免 Windows / Linux 协作时满屏 diff
+* text=auto
+
+# 源码与文本
+*.py    text eol=lf
+*.md    text eol=lf
+*.txt   text eol=lf
+*.json  text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+.gitignore   text eol=lf
+.gitattributes text eol=lf
+
+# Windows 批处理必须保持 CRLF，否则可能无法执行
+*.bat   text eol=crlf
+*.cmd   text eol=crlf
+
+# 二进制文件不做换行转换
+*.onnx  binary
+*.npy   binary
+*.wav   binary
+*.png   binary
+*.jpg   binary
+*.ico   binary

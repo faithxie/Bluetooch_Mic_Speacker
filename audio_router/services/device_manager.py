@@ -328,8 +328,38 @@ class DeviceManager:
         return None
 
     @staticmethod
-    def refresh() -> List[AudioDeviceInfo]:
-        """刷新设备列表（重新查询）"""
+    def reload_portaudio() -> bool:
+        """重载 PortAudio，使蓝牙等「运行期新接入」的设备能被枚举到。
+
+        为什么需要这一步：
+        PortAudio 在首次初始化时建立一份设备表快照，之后 sd.query_devices()
+        一直读这份快照。蓝牙耳机若是在程序**启动之后**才连上（非常常见：
+        先开程序、再连耳机），旧快照里根本没有它的端点 →
+        无论点多少次「刷新」都看不到蓝牙设备。
+        terminate + initialize 会重新扫描系统音频端点。
+
+        安全性：调用前必须确保没有任何音频流在运行，否则会打断播放。
+        本方法仅改变全局 PortAudio 状态，失败时静默返回 False。
+        """
+        try:
+            sd._terminate()
+            sd._initialize()
+            # 重新初始化后，默认设备索引可能已变化，需刷新缓存
+            sd.default.reset()
+            return True
+        except Exception:
+            return False
+
+    @staticmethod
+    def refresh(reload: bool = True) -> List[AudioDeviceInfo]:
+        """刷新设备列表。
+
+        reload=True（默认）会先重载 PortAudio，以便发现运行期新接入的
+        蓝牙耳机等设备。若当前有音频流在运行，调用方应传 reload=False，
+        避免打断正在播放的声音。
+        """
+        if reload:
+            DeviceManager.reload_portaudio()
         return DeviceManager.get_all_devices()
 
     @staticmethod

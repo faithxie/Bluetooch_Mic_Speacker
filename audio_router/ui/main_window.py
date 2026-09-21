@@ -928,6 +928,13 @@ class MainWindow:
             prev_in = self.input_combo.get()
             prev_out = self.output_combo.get()
 
+            # 【关键】重载 PortAudio，才能发现「程序启动后才连上」的蓝牙耳机。
+            # PortAudio 首次初始化后一直用设备表快照，不重载就永远看不到新设备。
+            # 但引擎运行中不能重载（会打断音频流），此时退化为仅重新查询。
+            reloaded = False
+            if not self.engine.is_running:
+                reloaded = DeviceManager.reload_portaudio()
+
             # 获取按优先级排序且过滤可用的设备
             all_input = DeviceManager.get_input_devices(sort_by_priority=True)
             all_output = DeviceManager.get_output_devices(sort_by_priority=True)
@@ -981,9 +988,18 @@ class MainWindow:
                 if new_out != prev_out:
                     changes.append(f"输出 → {new_out}")
                 if not changes:
-                    changes.append("设备列表已更新，当前选择未变")
+                    changes.append("当前选择未变")
 
-                # 顺带汇报系统默认设备，便于用户核对
+                # 汇总扫描结果，特别是蓝牙设备是否已出现
+                bt_in = [d for d in self._input_devices if d.is_bluetooth]
+                bt_out = [d for d in self._output_devices if d.is_bluetooth]
+                scan_txt = (
+                    f"扫描到 {len(self._input_devices)} 个输入 / "
+                    f"{len(self._output_devices)} 个输出设备\n"
+                    f"其中蓝牙：输入 {len(bt_in)} 个，输出 {len(bt_out)} 个"
+                    + ("" if (bt_in or bt_out) else "　⚠️ 未发现蓝牙设备"))
+
+                # 汇报系统默认设备，便于用户核对
                 try:
                     sd_in = DeviceManager.find_system_default_input()
                     sd_out = DeviceManager.find_system_default_output()
@@ -994,9 +1010,16 @@ class MainWindow:
                 except Exception:
                     default_txt = ""
 
+                hint = ""
+                if not reloaded and self.engine.is_running:
+                    hint = ("\n\n注意：路由运行中，本次未重载音频驱动。\n"
+                            "如需发现新连接的蓝牙设备，请先停止路由再刷新。")
+
                 messagebox.showinfo(
                     "刷新完成",
-                    "已重新扫描系统音频设备。\n\n" + "\n".join(changes) + default_txt)
+                    "已重新扫描系统音频设备。\n\n"
+                    + scan_txt + "\n\n变化：\n" + "\n".join(changes)
+                    + default_txt + hint)
 
         except Exception as e:
             messagebox.showerror("Error", f"Failed to refresh devices: {str(e)}")

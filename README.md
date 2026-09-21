@@ -10,6 +10,9 @@ Windows 本地实时音频路由工具 · 蓝牙耳机麦克风 →（防啸叫�
 [![Platform](https://img.shields.io/badge/Platform-Windows-0078D4?logo=windows&logoColor=white)](#系统要求)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Audio](https://img.shields.io/badge/Engine-PortAudio%20%2F%20WASAPI-orange.svg)](#技术栈)
+[![Release](https://img.shields.io/github/v/release/faithxie/Bluetooch_Mic_Speacker?label=下载&color=2f7df6)](https://github.com/faithxie/Bluetooch_Mic_Speacker/releases/latest)
+
+**▶ [点此下载最新版 BTSPK.exe](https://github.com/faithxie/Bluetooch_Mic_Speacker/releases/latest)** —— 免安装，双击即用
 
 </div>
 
@@ -114,6 +117,30 @@ venv\Scripts\python.exe -m PyInstaller --noconfirm --clean build_exe.spec
 | 设备偏好 | 打包后写入 `%APPDATA%\BTSPK\.device_prefs.json`（源码运行仍写项目根目录） |
 | 运行日志 | `%APPDATA%\BTSPK\BTSPK.log`，启动失败时会有弹窗提示 |
 | 启动速度 | onefile 首次启动需解包，约 1~3 秒；如需更快把 spec 里 `ONE_FILE = False` 改为目录版 |
+
+### 直接下载
+
+不想自己打包？到 [**Releases**](https://github.com/faithxie/Bluetooch_Mic_Speacker/releases/latest) 页面下载最新的 `BTSPK.exe`，双击即用。
+
+### 发布 Release（维护者）
+
+把 `dist\BTSPK.exe` 一键发到 GitHub Releases，无需安装 `gh` CLI：
+
+```bash
+venv\Scripts\python.exe release.py            # 版本号自动 +1（补丁位）
+venv\Scripts\python.exe release.py v1.1.0     # 指定版本号
+venv\Scripts\python.exe release.py v1.1.0 --draft        # 先存草稿
+venv\Scripts\python.exe release.py v1.1.0 --notes 说明.md  # 自定义发布说明
+```
+
+脚本会自动：打 tag → 建 Release → 上传 exe 附件，并生成带 SHA256 校验值的默认发布说明。
+
+| 事项 | 说明 |
+|---|---|
+| 凭据 | 通过 `git credential fill` 读 Windows 凭据管理器，**不落盘**；只要能 `git push` 就能用 |
+| 幂等 | tag / Release / 同名附件已存在时会复用或覆盖，可安全重跑 |
+| 网络 | 默认**直连**，绕过本地代理（代理转发大文件上传会返回 502 Bad Gateway） |
+| 失败重试 | 所有 API 调用内置指数退避重试，网络抖动可自愈 |
 
 ### 使用步骤
 

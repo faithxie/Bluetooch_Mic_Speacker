@@ -49,6 +49,9 @@ aec_experiment/*.onnx
 aec_experiment/*.npy
 
 # ===== 本地排障产物 =====
+# 界面截图对比（仅本地参考，不入库）
+ui_before.png
+ui_after.png
 # hosts 等系统文件的本地备份（仅调试网络用，绝不入库）
 _hosts_backup/
 

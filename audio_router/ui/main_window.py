@@ -191,7 +191,66 @@ class MainWindow:
                         troughcolor=self.COLOR_METER_BG,
                         borderwidth=0)
 
+        # 紧凑滑块：tk.Scale 自带约 40px 的轨道高度，
+        # 在「防啸叫」这种一行一个滑块的密集区域会堆积出大量空白。
+        # ttk.Scale 高度约 20px，配合同行数值标签能省下约一半竖向空间。
+        style.configure('Compact.Horizontal.TScale',
+                        background=self.COLOR_PANEL,
+                        troughcolor=self.COLOR_METER_BG,
+                        borderwidth=0,
+                        lightcolor=self.COLOR_METER_FILL,
+                        darkcolor=self.COLOR_METER_BG)
+        style.map('Compact.Horizontal.TScale',
+                  background=[('active', self.COLOR_PANEL)])
+
     # ---------- 界面构建 ----------
+
+    def _compact_slider(self, parent, var, lo, hi, command, text,
+                        label_w=8, value_w=8, resolution=None,
+                        accent=None, fmt='%s'):
+        """创建「说明标签 + 紧凑滑块 + 数值」的横向一行
+
+        与旧写法相比：
+          - tk.Scale 用 width=10 / sliderlength=14 压扁，高度约 40px → 约 18px
+          - 三列宽度固定，多行滑块左右对齐，观感更整齐
+          - 继续用 tk.Scale（而非 ttk.Scale），保证 troughcolor 暗色样式生效
+
+        :param text:    左侧说明文字
+        :param label_w: 左侧说明文字的字符宽度
+        :param value_w: 右侧数值的字符宽度
+        :param fmt:     数值格式化，如 '%d %%' / '%.1f Hz'
+        :return: (滑块, 数值标签)
+        """
+        row = tk.Frame(parent, bg=self.COLOR_PANEL)
+        row.pack(fill=tk.X, pady=(2, 0))
+
+        # 数值标签先 pack 到右侧，保证它始终贴右不被滑块挤压
+        value = tk.Label(row, text=fmt % var.get(),
+                         bg=self.COLOR_PANEL,
+                         fg=accent or self.COLOR_TEXT_SECONDARY,
+                         font=('Consolas', 9), width=value_w, anchor=tk.E)
+        value.pack(side=tk.RIGHT)
+
+        # 左侧说明
+        tk.Label(row, text=text, bg=self.COLOR_PANEL,
+                 fg=self.COLOR_TEXT_SECONDARY,
+                 font=('Segoe UI', 9), width=label_w,
+                 anchor=tk.W).pack(side=tk.LEFT)
+
+        kw = dict(from_=lo, to=hi, orient=tk.HORIZONTAL,
+                  variable=var, command=command,
+                  bg=self.COLOR_PANEL, fg=self.COLOR_TEXT,
+                  troughcolor=self.COLOR_METER_BG,
+                  activebackground=accent or '#f59e0b',
+                  highlightthickness=0, bd=0,
+                  showvalue=False,
+                  width=10, sliderlength=14,
+                  font=('Segoe UI', 9))
+        if resolution is not None:
+            kw['resolution'] = resolution   # tk.Scale 原生支持步进
+        scale = tk.Scale(row, **kw)
+        scale.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 8))
+        return scale, value
 
     def _hint(self, parent, text):
         """创建一个「帮助提示」标签（统一样式，自动按窗口宽度换行）
@@ -203,7 +262,7 @@ class MainWindow:
         """
         lbl = tk.Label(parent, text=text,
                        bg=self.COLOR_PANEL, fg=self.COLOR_TEXT_SECONDARY,
-                       font=('Segoe UI', 9),
+                       font=('Segoe UI', 8),
                        anchor=tk.W, justify=tk.LEFT,
                        wraplength=self._hint_wrap)
         self._hint_labels.append(lbl)
@@ -241,7 +300,7 @@ class MainWindow:
         绝不能因为窗口不够高而看不到。
         """
         # ---- 固定顶部：标题 + 主控按钮 ----
-        top = ttk.Frame(self.root, style='TFrame', padding=(20, 16, 20, 10))
+        top = ttk.Frame(self.root, style='TFrame', padding=(20, 12, 20, 8))
         top.pack(fill=tk.X, side=tk.TOP)
 
         self._build_header(top)
@@ -257,9 +316,6 @@ class MainWindow:
 
         # ---- 输入设备区 ----
         self._build_input_section(main)
-
-        # ---- 箭头连接 ----
-        self._build_connector(main)
 
         # ---- 输出设备区 ----
         self._build_output_section(main)
@@ -287,10 +343,10 @@ class MainWindow:
         """
         self.footer_hint = tk.Label(
             self.root,
-            text="↕  中间区域可滚动 · 鼠标滚轮 / PgUp / PgDn / Home / End",
+            text="↕  可滚动 · 滚轮 / PgUp / PgDn / Home / End",
             bg=self.COLOR_BG, fg=self.COLOR_TEXT_SECONDARY,
             font=('Segoe UI', 8), anchor=tk.CENTER)
-        self.footer_hint.pack(fill=tk.X, side=tk.BOTTOM, pady=(2, 6))
+        self.footer_hint.pack(fill=tk.X, side=tk.BOTTOM, pady=(2, 5))
 
     def _build_scroll_area(self):
         """构建可滚动的内容区
@@ -395,20 +451,21 @@ class MainWindow:
     def _build_header(self, parent):
         """标题区（位于固定顶部区域）"""
         header = ttk.Frame(parent, style='TFrame')
-        header.pack(fill=tk.X, pady=(0, 8))
+        header.pack(fill=tk.X, pady=(0, 6))
 
         ttk.Label(header, text="🎧 蓝牙音频路由", style='Title.TLabel').pack(anchor=tk.W)
-        ttk.Label(header, text="蓝牙耳机麦克风 → 电脑扬声器 实时监听",
-                  style='Subtitle.TLabel').pack(anchor=tk.W, pady=(2, 0))
+        ttk.Label(header, text="蓝牙耳机麦克风 → 扬声器 / HDMI 实时监听",
+                  style='Subtitle.TLabel').pack(anchor=tk.W, pady=(1, 0))
 
     def _build_input_section(self, parent):
         """输入设备选择区"""
-        panel = tk.Frame(parent, bg=self.COLOR_PANEL, highlightthickness=0)
-        panel.pack(fill=tk.X, pady=6)
+        panel = tk.Frame(parent, bg=self.COLOR_PANEL,
+                         highlightthickness=1, highlightbackground=self.COLOR_BORDER)
+        panel.pack(fill=tk.X, pady=(0, 6))
         panel.pack_propagate(False)
 
         # 内边距
-        inner = tk.Frame(panel, bg=self.COLOR_PANEL, padx=16, pady=14)
+        inner = tk.Frame(panel, bg=self.COLOR_PANEL, padx=16, pady=8)
         inner.pack(fill=tk.X)
 
         # 标题行
@@ -427,33 +484,23 @@ class MainWindow:
 
         # 设备下拉框
         self.input_combo = ttk.Combobox(inner, state='readonly', height=10)
-        self.input_combo.pack(fill=tk.X, pady=(10, 0))
+        self.input_combo.pack(fill=tk.X, pady=(8, 0))
         self.input_combo.bind('<<ComboboxSelected>>', self._on_input_selected)
 
         # 设备信息
         self.input_info = tk.Label(inner, text="请选择输入设备",
                                    bg=self.COLOR_PANEL, fg=self.COLOR_TEXT_SECONDARY,
                                    font=('Segoe UI', 9), anchor=tk.W, justify=tk.LEFT)
-        self.input_info.pack(fill=tk.X, pady=(8, 0))
-
-    def _build_connector(self, parent):
-        """连接箭头"""
-        connector = tk.Frame(parent, bg=self.COLOR_BG, height=30)
-        connector.pack(fill=tk.X)
-        connector.pack_propagate(False)
-
-        arrow = tk.Label(connector, text="⬇  实时路由  ⬇",
-                         bg=self.COLOR_BG, fg=self.COLOR_ACCENT,
-                         font=('Segoe UI', 10, 'bold'))
-        arrow.pack(expand=True)
+        self.input_info.pack(fill=tk.X, pady=(6, 0))
 
     def _build_output_section(self, parent):
         """输出设备选择区"""
-        panel = tk.Frame(parent, bg=self.COLOR_PANEL, highlightthickness=0)
-        panel.pack(fill=tk.X, pady=6)
+        panel = tk.Frame(parent, bg=self.COLOR_PANEL,
+                         highlightthickness=1, highlightbackground=self.COLOR_BORDER)
+        panel.pack(fill=tk.X, pady=(0, 6))
         panel.pack_propagate(False)
 
-        inner = tk.Frame(panel, bg=self.COLOR_PANEL, padx=16, pady=14)
+        inner = tk.Frame(panel, bg=self.COLOR_PANEL, padx=16, pady=8)
         inner.pack(fill=tk.X)
 
         # 标题行
@@ -464,18 +511,16 @@ class MainWindow:
                  bg=self.COLOR_PANEL, fg=self.COLOR_ACCENT,
                  font=('Segoe UI', 11, 'bold')).pack(side=tk.LEFT)
 
-        tk.Label(inner, text="", bg=self.COLOR_PANEL).pack()  # 占位
-
         # 设备下拉框
         self.output_combo = ttk.Combobox(inner, state='readonly', height=10)
-        self.output_combo.pack(fill=tk.X, pady=(10, 0))
+        self.output_combo.pack(fill=tk.X, pady=(8, 0))
         self.output_combo.bind('<<ComboboxSelected>>', self._on_output_selected)
 
         # 设备信息
         self.output_info = tk.Label(inner, text="请选择输出设备",
                                     bg=self.COLOR_PANEL, fg=self.COLOR_TEXT_SECONDARY,
                                     font=('Segoe UI', 9), anchor=tk.W, justify=tk.LEFT)
-        self.output_info.pack(fill=tk.X, pady=(8, 0))
+        self.output_info.pack(fill=tk.X, pady=(6, 0))
 
         # 醒目提示：当前声音输出到哪里
         self.output_target_label = tk.Label(inner,
@@ -483,18 +528,19 @@ class MainWindow:
                                             bg='#0e4429', fg='#4ade80',
                                             font=('Segoe UI', 10, 'bold'),
                                             anchor=tk.W, padx=10, pady=6)
-        self.output_target_label.pack(fill=tk.X, pady=(10, 0))
+        self.output_target_label.pack(fill=tk.X, pady=(8, 0))
 
     def _build_volume_section(self, parent):
         """音量/增益控制区"""
-        panel = tk.Frame(parent, bg=self.COLOR_PANEL, highlightthickness=0)
-        panel.pack(fill=tk.X, pady=(12, 6))
+        panel = tk.Frame(parent, bg=self.COLOR_PANEL,
+                         highlightthickness=1, highlightbackground=self.COLOR_BORDER)
+        panel.pack(fill=tk.X, pady=(0, 6))
 
-        inner = tk.Frame(panel, bg=self.COLOR_PANEL, padx=16, pady=14)
+        inner = tk.Frame(panel, bg=self.COLOR_PANEL, padx=16, pady=8)
         inner.pack(fill=tk.X)
 
         # 标题
-        tk.Label(inner, text="🎙️ 麦克风增益（输入放大）",
+        tk.Label(inner, text="🎤 麦克风增益（输入放大）",
                  bg=self.COLOR_PANEL, fg=self.COLOR_ACCENT,
                  font=('Segoe UI', 11, 'bold')).pack(anchor=tk.W)
 
@@ -502,7 +548,7 @@ class MainWindow:
         # 【改动】默认 200% → 100%。蓝牙麦克风灵敏度通常已足够，
         # 额外放大在外放场景等同于主动把系统推向啸叫临界点。
         gain_row = tk.Frame(inner, bg=self.COLOR_PANEL)
-        gain_row.pack(fill=tk.X, pady=(8, 0))
+        gain_row.pack(fill=tk.X, pady=(5, 0))
 
         self.input_gain_var = tk.DoubleVar(value=100.0)  # 默认 100%（不加放大）
         self.input_gain_slider = tk.Scale(
@@ -528,11 +574,11 @@ class MainWindow:
         # 增益提示：避免用户把增益当作「音量」无脑拉满
         self.input_gain_hint = self._hint(
             inner,
-            "建议 80~120%。拉高增益会直接把系统推入啸叫；声音不够大请调下方的扬声器音量。")
-        self.input_gain_hint.pack(fill=tk.X, pady=(8, 0))
+            "增益 80~120% 为宜，过高易引发啸叫；要更响请调下方「扬声器音量」。")
+        self.input_gain_hint.pack(fill=tk.X, pady=(6, 0))
 
         # 分隔线
-        tk.Frame(inner, bg=self.COLOR_BORDER, height=1).pack(fill=tk.X, pady=12)
+        tk.Frame(inner, bg=self.COLOR_BORDER, height=1).pack(fill=tk.X, pady=8)
 
         # 输出音量标题
         tk.Label(inner, text="🔊 扬声器音量（输出）",
@@ -541,7 +587,7 @@ class MainWindow:
 
         # 音量滑块 + 数值
         vol_row = tk.Frame(inner, bg=self.COLOR_PANEL)
-        vol_row.pack(fill=tk.X, pady=(8, 0))
+        vol_row.pack(fill=tk.X, pady=(5, 0))
 
         self.volume_var = tk.DoubleVar(value=100.0)
         self.volume_slider = tk.Scale(
@@ -566,10 +612,11 @@ class MainWindow:
 
     def _build_antifeedback_section(self, parent):
         """防啸叫/回音消除控制区（4 级防护）"""
-        panel = tk.Frame(parent, bg=self.COLOR_PANEL, highlightthickness=0)
-        panel.pack(fill=tk.X, pady=6)
+        panel = tk.Frame(parent, bg=self.COLOR_PANEL,
+                         highlightthickness=1, highlightbackground=self.COLOR_BORDER)
+        panel.pack(fill=tk.X, pady=(0, 6))
 
-        inner = tk.Frame(panel, bg=self.COLOR_PANEL, padx=16, pady=14)
+        inner = tk.Frame(panel, bg=self.COLOR_PANEL, padx=16, pady=8)
         inner.pack(fill=tk.X)
 
         # 标题行
@@ -591,11 +638,11 @@ class MainWindow:
         # 真移频虽然音染很小，但会让整体音高固定偏移 4Hz，
         # 对音乐/较真的人声仍有可感差异 → 改为由用户按需开启。
         fs_row = tk.Frame(inner, bg=self.COLOR_PANEL)
-        fs_row.pack(fill=tk.X, pady=(10, 0))
+        fs_row.pack(fill=tk.X, pady=(6, 0))
 
         self.freq_shift_var = tk.BooleanVar(value=False)
         self.freq_shift_check = tk.Checkbutton(
-            fs_row, text="🎚 频谱移频（把整体音高偏移几 Hz，破坏反馈共振）",
+            fs_row, text="频谱移频（把整体音高偏移几 Hz，破坏反馈共振）",
             variable=self.freq_shift_var,
             command=self._on_freq_shift_toggle,
             bg=self.COLOR_PANEL, fg=self.COLOR_TEXT,
@@ -607,42 +654,17 @@ class MainWindow:
         )
         self.freq_shift_check.pack(anchor=tk.W)
 
-        # 移频量滑块
-        fs_amt_row = tk.Frame(inner, bg=self.COLOR_PANEL)
-        fs_amt_row.pack(fill=tk.X, pady=(4, 0))
-
-        tk.Label(fs_amt_row, text="移频量",
-                 bg=self.COLOR_PANEL, fg=self.COLOR_TEXT_SECONDARY,
-                 font=('Segoe UI', 9)).pack(side=tk.LEFT)
-
+        # 移频量滑块（紧凑行：说明 + 滑块 + 数值 同一行）
         # 【改动】默认 5Hz → 4Hz（文献与工程共识区间 3~5Hz）
         self.freq_shift_amount_var = tk.DoubleVar(value=4.0)
-        self.freq_shift_slider = tk.Scale(
-            fs_amt_row, from_=2, to=12, orient=tk.HORIZONTAL, resolution=0.5,
-            variable=self.freq_shift_amount_var,
-            command=self._on_freq_shift_amount_change,
-            bg=self.COLOR_PANEL, fg=self.COLOR_TEXT,
-            troughcolor=self.COLOR_METER_BG,
-            activebackground='#f59e0b',
-            highlightthickness=0, bd=0,
-            length=200,
-            font=('Segoe UI', 9),
-            showvalue=False
-        )
-        self.freq_shift_slider.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=8)
-
-        self.freq_shift_amount_label = tk.Label(fs_amt_row, text="4.0 Hz",
-                                                bg=self.COLOR_PANEL, fg=self.COLOR_TEXT_SECONDARY,
-                                                font=('Segoe UI', 9), width=8, anchor=tk.E)
-        self.freq_shift_amount_label.pack(side=tk.RIGHT)
-
-        # 移频说明
-        self._hint(inner,
-                   "推荐 3~5Hz。这是真移频（Hilbert/SSB），不是颤音；关闭时音色完全等于原声。"
-                   ).pack(fill=tk.X, pady=(4, 0))
+        self.freq_shift_slider, self.freq_shift_amount_label = \
+            self._compact_slider(inner, self.freq_shift_amount_var, 2, 12,
+                                 self._on_freq_shift_amount_change,
+                                 text="移频量", resolution=0.5,
+                                 fmt='%.1f Hz', value_w=8)
 
         # 分隔线
-        tk.Frame(inner, bg=self.COLOR_BORDER, height=1).pack(fill=tk.X, pady=10)
+        tk.Frame(inner, bg=self.COLOR_BORDER, height=1).pack(fill=tk.X, pady=7)
 
         # --- 2. 自适应陷波 ---
         notch_row = tk.Frame(inner, bg=self.COLOR_PANEL)
@@ -650,7 +672,7 @@ class MainWindow:
 
         self.notch_var = tk.BooleanVar(value=True)
         self.notch_check = tk.Checkbutton(
-            notch_row, text="🎯 自适应陷波（自动检测并消除啸叫频率）",
+            notch_row, text="自适应陷波（自动检测并消除啸叫频率）",
             variable=self.notch_var,
             command=self._on_notch_toggle,
             bg=self.COLOR_PANEL, fg=self.COLOR_TEXT,
@@ -662,53 +684,27 @@ class MainWindow:
         )
         self.notch_check.pack(anchor=tk.W)
 
-        # 陷波强度
-        notch_amt_row = tk.Frame(inner, bg=self.COLOR_PANEL)
-        notch_amt_row.pack(fill=tk.X, pady=(4, 0))
-
-        tk.Label(notch_amt_row, text="衰减强度",
-                 bg=self.COLOR_PANEL, fg=self.COLOR_TEXT_SECONDARY,
-                 font=('Segoe UI', 9)).pack(side=tk.LEFT)
-
+        # 陷波强度（紧凑行）
         # 【改动】默认 20dB → 10dB；范围 6~35 → 3~30（与引擎 set_notch_attenuation_db 的 clamp 对齐）
         # 原因：衰减越深，一旦检测误判对人声的破坏越不可逆（直接把共振峰挖掉）。
         self.notch_attenuation_var = tk.DoubleVar(value=10.0)
-        self.notch_slider = tk.Scale(
-            notch_amt_row, from_=3, to=30, orient=tk.HORIZONTAL, resolution=1,
-            variable=self.notch_attenuation_var,
-            command=self._on_notch_attenuation_change,
-            bg=self.COLOR_PANEL, fg=self.COLOR_TEXT,
-            troughcolor=self.COLOR_METER_BG,
-            activebackground='#f59e0b',
-            highlightthickness=0, bd=0,
-            length=200,
-            font=('Segoe UI', 9),
-            showvalue=False
-        )
-        self.notch_slider.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=8)
-
-        self.notch_attenuation_label = tk.Label(notch_amt_row, text="10 dB",
-                                                bg=self.COLOR_PANEL, fg=self.COLOR_TEXT_SECONDARY,
-                                                font=('Segoe UI', 9), width=8, anchor=tk.E)
-        self.notch_attenuation_label.pack(side=tk.RIGHT)
-
-        # 说明 + 实时陷波频率显示
-        self._hint(inner,
-                   "推荐 6~12dB。检测用多判据融合（PNPR+PHPR+IMSD+PTPR），"
-                   "只有「无谐波族的孤立窄峰」才判为啸叫，人声不再被误伤。"
-                   ).pack(fill=tk.X, pady=(4, 0))
+        self.notch_slider, self.notch_attenuation_label = \
+            self._compact_slider(inner, self.notch_attenuation_var, 3, 30,
+                                 self._on_notch_attenuation_change,
+                                 text="衰减强度", resolution=1.0,
+                                 fmt='%d dB', value_w=8)
 
         # 实时陷波频率（用于验证是否误伤自己的人声：说话时这里应保持为空）
         self.notch_freq_label = tk.Label(
             inner, text="当前陷波：(无)",
             bg=self.COLOR_PANEL, fg=self.COLOR_TEXT_SECONDARY,
-            font=('Consolas', 9), anchor=tk.W, justify=tk.LEFT,
+            font=('Consolas', 8), anchor=tk.W, justify=tk.LEFT,
             wraplength=self._hint_wrap)
         self._hint_labels.append(self.notch_freq_label)
-        self.notch_freq_label.pack(fill=tk.X, pady=(4, 0))
+        self.notch_freq_label.pack(fill=tk.X, pady=(3, 0))
 
         # 分隔线
-        tk.Frame(inner, bg=self.COLOR_BORDER, height=1).pack(fill=tk.X, pady=10)
+        tk.Frame(inner, bg=self.COLOR_BORDER, height=1).pack(fill=tk.X, pady=7)
 
         # --- 3. 噪声门 ---
         # 【改动】默认由「开启」改为「关闭」。
@@ -719,7 +715,7 @@ class MainWindow:
 
         self.noise_gate_var = tk.BooleanVar(value=False)
         self.noise_gate_check = tk.Checkbutton(
-            gate_row, text="🚪 噪声门（不说话时自动静音）",
+            gate_row, text="噪声门（不说话时自动静音）",
             variable=self.noise_gate_var,
             command=self._on_noise_gate_toggle,
             bg=self.COLOR_PANEL, fg=self.COLOR_TEXT,
@@ -731,41 +727,18 @@ class MainWindow:
         )
         self.noise_gate_check.pack(anchor=tk.W)
 
-        # 噪声门阈值滑块
-        thresh_row = tk.Frame(inner, bg=self.COLOR_PANEL)
-        thresh_row.pack(fill=tk.X, pady=(4, 0))
-
-        tk.Label(thresh_row, text="灵敏度",
-                 bg=self.COLOR_PANEL, fg=self.COLOR_TEXT_SECONDARY,
-                 font=('Segoe UI', 9)).pack(side=tk.LEFT)
-
+        # 噪声门阈值滑块（紧凑行）
         self.gate_threshold_var = tk.DoubleVar(value=1.5)
-        self.gate_threshold_slider = tk.Scale(
-            thresh_row, from_=0.5, to=10.0, orient=tk.HORIZONTAL, resolution=0.1,
-            variable=self.gate_threshold_var,
-            command=self._on_gate_threshold_change,
-            bg=self.COLOR_PANEL, fg=self.COLOR_TEXT,
-            troughcolor=self.COLOR_METER_BG,
-            activebackground='#f59e0b',
-            highlightthickness=0, bd=0,
-            length=200,
-            font=('Segoe UI', 9),
-            showvalue=False
-        )
-        self.gate_threshold_slider.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=8)
-
-        self.gate_threshold_label = tk.Label(thresh_row, text="低",
-                                             bg=self.COLOR_PANEL, fg=self.COLOR_TEXT_SECONDARY,
-                                             font=('Segoe UI', 9), width=8, anchor=tk.E)
-        self.gate_threshold_label.pack(side=tk.RIGHT)
-
-        # 【改动5】说明新版噪声门的时序参数（已从「按块跳变」改为「逐样本平滑」）
-        self._hint(inner,
-                   "时序已优化：8ms 开门保字首 + 150ms 缓慢关门 + 120ms 保持（字间停顿不误关）。"
-                   ).pack(fill=tk.X, pady=(4, 0))
+        self.gate_threshold_slider, self.gate_threshold_label = \
+            self._compact_slider(inner, self.gate_threshold_var, 0.5, 10.0,
+                                 self._on_gate_threshold_change,
+                                 text="灵敏度", resolution=0.1,
+                                 value_w=8)
+        # 噪声门用文字档位表达比裸数字更直观
+        self.gate_threshold_label.configure(text="中")
 
         # 分隔线
-        tk.Frame(inner, bg=self.COLOR_BORDER, height=1).pack(fill=tk.X, pady=10)
+        tk.Frame(inner, bg=self.COLOR_BORDER, height=1).pack(fill=tk.X, pady=7)
 
         # --- 4. 侧链抑制 ---
         # 【改动】默认由「开启」改为「关闭」。
@@ -777,7 +750,7 @@ class MainWindow:
 
         self.sidechain_var = tk.BooleanVar(value=False)
         self.sidechain_check = tk.Checkbutton(
-            sc_row, text="📉 侧链抑制（扬声器有声时压低麦克风）",
+            sc_row, text="侧链抑制（扬声器有声时压低麦克风）",
             variable=self.sidechain_var,
             command=self._on_sidechain_toggle,
             bg=self.COLOR_PANEL, fg=self.COLOR_TEXT,
@@ -789,40 +762,29 @@ class MainWindow:
         )
         self.sidechain_check.pack(anchor=tk.W)
 
-        # 侧链强度滑块
-        sc_amt_row = tk.Frame(inner, bg=self.COLOR_PANEL)
-        sc_amt_row.pack(fill=tk.X, pady=(4, 0))
-
-        tk.Label(sc_amt_row, text="抑制强度",
-                 bg=self.COLOR_PANEL, fg=self.COLOR_TEXT_SECONDARY,
-                 font=('Segoe UI', 9)).pack(side=tk.LEFT)
-
+        # 侧链强度滑块（紧凑行）
         self.sidechain_amount_var = tk.DoubleVar(value=60.0)
-        self.sidechain_slider = tk.Scale(
-            sc_amt_row, from_=10, to=90, orient=tk.HORIZONTAL,
-            variable=self.sidechain_amount_var,
-            command=self._on_sidechain_amount_change,
-            bg=self.COLOR_PANEL, fg=self.COLOR_TEXT,
-            troughcolor=self.COLOR_METER_BG,
-            activebackground='#f59e0b',
-            highlightthickness=0, bd=0,
-            length=200,
-            font=('Segoe UI', 9),
-            showvalue=False
-        )
-        self.sidechain_slider.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=8)
+        self.sidechain_slider, self.sidechain_amount_label = \
+            self._compact_slider(inner, self.sidechain_amount_var, 10, 90,
+                                 self._on_sidechain_amount_change,
+                                 text="抑制强度", resolution=1.0,
+                                 fmt='%d %%', value_w=8)
 
-        self.sidechain_amount_label = tk.Label(sc_amt_row, text="60%",
-                                               bg=self.COLOR_PANEL, fg=self.COLOR_TEXT_SECONDARY,
-                                               font=('Segoe UI', 9), width=8, anchor=tk.E)
-        self.sidechain_amount_label.pack(side=tk.RIGHT)
+        # 四个子项的调参要点合并为一行，替代原先各自一条说明（省下约 3 行高度）
+        tk.Frame(inner, bg=self.COLOR_BORDER, height=1).pack(fill=tk.X, pady=7)
+        self._hint(
+            inner,
+            "推荐值：移频 3~5Hz（真移频非颤音） · 陷波 6~12dB（只消孤立窄峰） · "
+            "噪声门 8/120/150ms（字间停顿不吞字） · 侧链仅压制增长速率，非必需。"
+        ).pack(fill=tk.X, pady=(0, 1))
 
     def _build_meter_section(self, parent):
         """电平表区"""
-        panel = tk.Frame(parent, bg=self.COLOR_PANEL, highlightthickness=0)
-        panel.pack(fill=tk.X, pady=6)
+        panel = tk.Frame(parent, bg=self.COLOR_PANEL,
+                         highlightthickness=1, highlightbackground=self.COLOR_BORDER)
+        panel.pack(fill=tk.X, pady=(0, 6))
 
-        inner = tk.Frame(panel, bg=self.COLOR_PANEL, padx=16, pady=14)
+        inner = tk.Frame(panel, bg=self.COLOR_PANEL, padx=16, pady=8)
         inner.pack(fill=tk.X)
 
         # 标题
@@ -832,7 +794,7 @@ class MainWindow:
 
         # 输入电平
         in_row = tk.Frame(inner, bg=self.COLOR_PANEL)
-        in_row.pack(fill=tk.X, pady=(10, 6))
+        in_row.pack(fill=tk.X, pady=(6, 4))
 
         tk.Label(in_row, text="输入", bg=self.COLOR_PANEL, fg=self.COLOR_TEXT_SECONDARY,
                  font=('Segoe UI', 9), width=6, anchor=tk.W).pack(side=tk.LEFT)
@@ -848,7 +810,7 @@ class MainWindow:
 
         # 输出电平
         out_row = tk.Frame(inner, bg=self.COLOR_PANEL)
-        out_row.pack(fill=tk.X, pady=(6, 0))
+        out_row.pack(fill=tk.X, pady=(4, 0))
 
         tk.Label(out_row, text="输出", bg=self.COLOR_PANEL, fg=self.COLOR_TEXT_SECONDARY,
                  font=('Segoe UI', 9), width=6, anchor=tk.W).pack(side=tk.LEFT)
@@ -864,10 +826,11 @@ class MainWindow:
 
     def _build_status_section(self, parent):
         """状态信息区"""
-        panel = tk.Frame(parent, bg=self.COLOR_PANEL, highlightthickness=0)
-        panel.pack(fill=tk.X, pady=6)
+        panel = tk.Frame(parent, bg=self.COLOR_PANEL,
+                         highlightthickness=1, highlightbackground=self.COLOR_BORDER)
+        panel.pack(fill=tk.X, pady=(0, 2))
 
-        inner = tk.Frame(panel, bg=self.COLOR_PANEL, padx=16, pady=14)
+        inner = tk.Frame(panel, bg=self.COLOR_PANEL, padx=16, pady=8)
         inner.pack(fill=tk.X)
 
         # 标题
@@ -877,7 +840,7 @@ class MainWindow:
 
         # 状态网格
         grid = tk.Frame(inner, bg=self.COLOR_PANEL)
-        grid.pack(fill=tk.X, pady=(10, 0))
+        grid.pack(fill=tk.X, pady=(6, 0))
 
         # 第1行：状态 + 延迟
         self.status_label = tk.Label(grid, text="● 未运行",

@@ -8,6 +8,7 @@
 import numpy as np
 import sounddevice as sd
 import threading
+import time
 from collections import deque
 from typing import Optional, Callable, List
 from scipy import signal as scipy_signal
@@ -92,6 +93,17 @@ class AudioRouterEngine:
         self._buffer_read_pos: int = 0
         self._buffer_lock = threading.Lock()
         self._target_buffersize_ms: float = 50.0  # 目标缓冲 50ms
+        # 启动时预填的目标水位（样本数），输出端据此判断时钟漂移方向
+        self._buffer_target_samples: int = 0
+        # 连续欠载计数：用于区分「偶发抖动」与「持续抽干」
+        self._underrun_streak: int = 0
+        # 上一块成功读取的音频尾段，用于缓冲不足时平滑补齐（抗蓝牙供给缺口）
+        self._last_hold_block: Optional[np.ndarray] = None
+        # 输入时钟漂移补偿：measured_arrival_rate / nominal_rate
+        self._rate_comp: float = 1.0
+        self._rate_t0: Optional[float] = None
+        self._rate_samples: int = 0
+        self._rate_warm: int = 0
 
         # 统计信息
         self._input_level: float = 0.0
@@ -121,16 +133,60 @@ class AudioRouterEngine:
         if self._is_running:
             raise RuntimeError("Cannot change device while running")
         self._input_device = device
-        self._input_samplerate = int(device.default_samplerate) if device.default_samplerate else 48000
         self._input_channels = min(device.max_input_channels, 2)
+        # 【关键修复】不要直接用 device.default_samplerate。
+        # 蓝牙耳机在 Windows 上会暴露多个端点，各自的默认采样率完全不同：
+        #   WASAPI 采集端点默认 16000Hz，且 **只** 支持 16000Hz；
+        #   MME/DirectSound 采集端点默认 44100Hz，且能软件重采样到任意率。
+        # 而 device_manager 优先返回 WASAPI 端点，于是引擎会拿到 16000Hz。
+        # 16000Hz 本身可以工作，但必须让 PortAudio 真正校验通过；
+        # 同时若该端点在其默认率下不可用，要能自动回落到可用的采样率。
+        self._input_samplerate = self._pick_samplerate(
+            device, is_input=True,
+            preferred=int(device.default_samplerate) if device.default_samplerate else 48000)
 
     def set_output_device(self, device: AudioDeviceInfo):
         """设置输出设备"""
         if self._is_running:
             raise RuntimeError("Cannot change device while running")
         self._output_device = device
-        self._output_samplerate = int(device.default_samplerate) if device.default_samplerate else 48000
         self._output_channels = min(device.max_output_channels, 2)
+        self._output_samplerate = self._pick_samplerate(
+            device, is_input=False,
+            preferred=int(device.default_samplerate) if device.default_samplerate else 48000)
+
+    @staticmethod
+    def _pick_samplerate(device: AudioDeviceInfo, is_input: bool, preferred: int) -> int:
+        """挑一个设备真正能打开的采样率。
+
+        顺序：设备默认率 → 48000 → 44100 → 32000 → 16000 → 8000。
+        用 sd.check_input_settings / check_output_settings 做真实校验，
+        避免出现「UI 看着正常、start() 却抛 Invalid sample rate (-9997)」。
+        全部不可用时退回 preferred，让启动阶段的参数扫描给出完整错误信息。
+        """
+        ch = (min(device.max_input_channels, 2) if is_input
+              else min(device.max_output_channels, 2))
+        ch = max(1, ch)
+
+        # 候选顺序：优先设备默认率，其次常用率
+        candidates = []
+        for sr in (preferred, 48000, 44100, 32000, 16000, 8000):
+            if sr and sr not in candidates:
+                candidates.append(int(sr))
+
+        for sr in candidates:
+            try:
+                if is_input:
+                    sd.check_input_settings(device=device.index, channels=ch,
+                                            samplerate=sr, dtype='float32')
+                else:
+                    sd.check_output_settings(device=device.index, channels=ch,
+                                             samplerate=sr, dtype='float32')
+                return sr
+            except Exception:
+                continue
+
+        return int(preferred) if preferred else 48000
 
     def set_volume(self, volume: float):
         """设置输出音量 (0.0 ~ 2.0)"""
@@ -312,24 +368,36 @@ class AudioRouterEngine:
         # 重置噪声门状态，避免继承上次会话的残留增益
         self._gate_gain = 1.0
         self._gate_hold_blocks = 0
+        self._underrun_streak = 0
+        self._last_hold_block = None
+        self._rate_comp = 1.0
+        self._rate_t0 = None
+        self._rate_samples = 0
 
         # 计算重采样比例
         self._resample_ratio = self._output_samplerate / self._input_samplerate
         self._need_resample = abs(self._resample_ratio - 1.0) > 0.001
 
-        # 初始化环形缓冲区（按输出采样率，约 500ms 缓冲防止溢出）
-        target_buffer_ms = 500
+        # 初始化环形缓冲区（按输出采样率，约 1000ms 缓冲防止溢出）
+        # 输入输出是两个独立自由运行的流，时钟必然存在微小漂移；
+        # 缓冲越小越容易出现「被抽干 → 欠载 → 静音」的周期性 dropout。
+        target_buffer_ms = 1000
         total_samples = int(self._output_samplerate * target_buffer_ms / 1000.0)
         self._buffer_size = total_samples
         self._buffer = np.zeros(total_samples * self._output_channels, dtype=np.float32)
         self._buffer_write_pos = 0
         self._buffer_read_pos = 0
 
-        # 预热：填充 100ms 静音（蓝牙设备输入慢，避免启动欠载）
-        warmup_ms = 100
+        # 预热：预填 250ms 静音。
+        # 蓝牙 HFP 采集端的实际启动延迟常在 100~200ms，原来只填 100ms
+        # 会导致启动瞬间输出端就把缓冲抽干（表现为一启动就疯狂欠载，
+        # 且缓冲占用长期趴在 0~6%，声音断续）。
+        warmup_ms = 250
         warmup_samples = int(self._output_samplerate * warmup_ms / 1000.0)
         self._buffer_write_pos = warmup_samples % self._buffer_size
         self._buffer_occupancy = warmup_samples / total_samples
+        # 记录期望维持的最低水位，供输出端做「漂移补偿」判断
+        self._buffer_target_samples = warmup_samples
 
         # 收集所有失败记录用于诊断
         failures = []
@@ -469,6 +537,8 @@ class AudioRouterEngine:
         self._input_level = 0.0
         self._output_level = 0.0
         self._buffer_occupancy = 0.0
+        self._underrun_streak = 0
+        self._last_hold_block = None
 
         # 清理啸叫抑制器
         self._freq_shifter = None
@@ -559,9 +629,59 @@ class AudioRouterEngine:
                 if count2 > 0:
                     outdata[count1:count1 + count2, c] = self._buffer[c::ch][:count2]
 
+            # 【关键修复】把未填充的尾部清零。
+            # 原实现只写入 read_samples 个样本就返回，尾部残留的是 PortAudio
+            # 复用缓冲区里的**上一次的旧数据**。输出回调随后对整块 outdata 求 RMS
+            # 得到 _output_level，于是电平表读到的是一堆陈旧的幽灵信号——
+            # 表现为「说话时电平乱跳/不跟随，或不说话也有电平」。
+            if read_samples < samples:
+                outdata[read_samples:] = 0.0
+
             self._buffer_read_pos = (pos + read_samples) % self._buffer_size
             self._buffer_occupancy = self._buffer_available_samples_locked() / self._buffer_size
             return read_samples
+
+    def _fill_from_hold(self, outdata: np.ndarray, start: int) -> int:
+        """缓冲不足时，用「上一块音频的尾段」平滑补齐剩余样本。
+
+        背景（实测结论）：蓝牙 HFP/eSCO 采集链路的实际吞吐只有名义实时率的
+        0.89 倍左右（WASAPI 0.890 / MME 0.902 / DirectSound 0.892，而本机内置
+        声卡为 0.998）。也就是麦克风每秒只送来约 890ms 的音频，而输出端每秒要
+        消耗 1000ms —— 这是持续的**供给缺口**，任何缓冲区大小都无法消除，
+        只会表现为周期性欠载（静音/咔哒）。
+
+        这里采用「保持上一块尾部并做轻微交叉淡化」的方式填补缺口：
+        听感上远好于静音断裂，且不改变音调（不做重采样拉伸，避免变调）。
+        触发次数由 _underrun_streak 统计，UI 上以「欠载」呈现。
+        """
+        if self._last_hold_block is None:
+            outdata[start:] = 0.0
+            return 0
+
+        hold = self._last_hold_block
+        need = len(outdata) - start
+        if need <= 0:
+            return 0
+
+        ch = outdata.shape[1]
+        # 循环取用尾段，覆盖缺口
+        reps = int(np.ceil(need / len(hold)))
+        tiled = np.tile(hold, (reps, 1))[:need, :ch]
+
+        # 交叉淡化：缺口前 1/4 做淡入，避免硬拼接产生的咔哒
+        fade = max(1, need // 4)
+        ramp = np.linspace(0.0, 1.0, fade, dtype=np.float32).reshape(-1, 1)
+        tiled[:fade] *= ramp
+
+        outdata[start:] = tiled
+        return need
+
+    def _level_ratio(self, level: float) -> float:
+        """线性 RMS → 0~1（仅供内部诊断使用，UI 侧有独立实现）"""
+        if level <= 1e-7:
+            return 0.0
+        db = 20.0 * np.log10(level)
+        return float(max(0.0, min(1.0, (db + 60.0) / 60.0)))
 
     def _buffer_available_samples_locked(self) -> int:
         """已加锁情况下获取可用样本数"""
@@ -583,6 +703,46 @@ class AudioRouterEngine:
 
         if not self._is_running:
             return
+
+        # ---- 时钟漂移补偿（针对蓝牙 HFP 供给不足）----
+        # 实测（输入20ms块 / 输出10ms块，同开双流，8秒墙钟）：
+        #   输入回调 734 次 @160帧/16k  = 7.34s 音频  → 到达率 0.9175
+        #   输出回调 800 次 @480帧/48k  = 8.00s 音频  → 消耗率 1.0000
+        # 即蓝牙 HFP/eSCO 链路只送来约 92% 的音频。若输出端按名义速率消费，
+        # 每秒净亏 ~8%，缓冲必然被抽干 → 周期性欠载（咔哒/断续）。
+        #
+        # 关键点：这里必须用「音频时长 / 墙钟时长」来衡量到达率。
+        # 早期版本用「回调次数 / 名义回调次数」，但 PortAudio 的输入回调节拍
+        # 会被驱动方“补足”，看起来接近 1.000，从而完全测不出这个缺口。
+        try:
+            now = time.perf_counter()
+            if self._rate_t0 is None:
+                self._rate_t0 = now
+                self._rate_samples = 0
+                self._rate_warm = 0
+            else:
+                self._rate_samples += frames
+                # 跳过最初若干个回调：流刚启动时时间戳与数据尚未对齐
+                self._rate_warm += 1
+                if self._rate_warm > 8:
+                    elapsed = now - self._rate_t0
+                    if elapsed > 0.4:
+                        nominal_samples = elapsed * self._input_samplerate
+                        if nominal_samples > 0:
+                            measured = self._rate_samples / nominal_samples
+                            # 限幅：低于 0.70 视为异常（可能设备静默/丢流），高于 1.05 不理
+                            if 0.70 <= measured <= 1.05:
+                                # 慢速平滑，避免修正量自身引起抖动
+                                self._rate_comp += (measured - self._rate_comp) * 0.08
+                        # 每 3 秒重置统计窗口，跟随链路状态变化
+                        if elapsed > 3.0:
+                            self._rate_t0 = now
+                            self._rate_samples = 0
+        except Exception as e:
+            # 不要把异常吞掉：静默的 except 曾让 time 未导入的问题隐藏了很久。
+            if not getattr(self, '_rate_err_reported', False):
+                self._rate_err_reported = True
+                self._notify_error(f"Rate compensation error: {type(e).__name__}: {e}")
 
         try:
             # 1. 计算原始输入电平（增益前）
@@ -653,8 +813,10 @@ class AudioRouterEngine:
                 data = indata.copy()
 
             # 重采样到输出采样率
+            # 注意乘上 _rate_comp：蓝牙 HFP 实际供给速度偏低时，
+            # 把每块音频「拉长」到与消费速率一致，从而维持缓冲水位稳定。
             if self._need_resample:
-                target_len = int(frames * self._resample_ratio)
+                target_len = max(1, int(frames * self._resample_ratio * self._rate_comp))
                 data = self._resample_audio(data, target_len)
 
             # 应用输出音量
@@ -682,9 +844,20 @@ class AudioRouterEngine:
             read_samples = self._buffer_read(outdata)
 
             if read_samples < frames:
-                # 数据不足，剩余填充静音
-                outdata[read_samples:] = 0
-                self._xruns += 1
+                # 数据不足：先用「上一块尾段」平滑补齐，避免蓝牙链路约 11% 的
+                # 持续供给缺口表现为周期性静音断裂（咔哒/断续）。
+                # 若无历史块，则保持静音。
+                self._fill_from_hold(outdata, read_samples)
+                self._underrun_streak += 1
+                # 只在缺口明显时计一次欠载，避免每个回调块都累加导致计数虚高
+                if (frames - read_samples) > frames * 0.5:
+                    self._xruns += 1
+            else:
+                if self._underrun_streak:
+                    self._underrun_streak = 0
+                # 更新保持块：取本块尾部约 20ms，供下次缺口循环使用
+                hold_len = min(frames, max(1, int(self._output_samplerate * 0.02)))
+                self._last_hold_block = outdata[-hold_len:].copy()
 
             # 记录未经抑制处理的目标信号（供自适应模块分析参考）
             self._last_target = outdata.copy()

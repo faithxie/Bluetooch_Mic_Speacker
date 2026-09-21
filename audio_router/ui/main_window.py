@@ -1206,6 +1206,10 @@ class MainWindow:
         self.start_button.config(text="▶  开始路由", bg=self.COLOR_ACCENT,
                                  activebackground=self.COLOR_ACCENT_HOVER)
         self.status_label.config(text="● 未运行", fg=self.COLOR_TEXT_SECONDARY)
+        self._ensure_meter_state()
+        self._meter_display = {'in': 0.0, 'out': 0.0}
+        self._meter_peak = {'in': 0.0, 'out': 0.0}
+        self._meter_peak_hold = {'in': 0, 'out': 0}
         self._draw_meter(self.input_meter_canvas, 0.0)
         self._draw_meter(self.output_meter_canvas, 0.0)
         self.input_meter_value.config(text="-∞ dB")
@@ -1240,10 +1244,21 @@ class MainWindow:
 
         if self.engine.is_running:
             # 更新电平表
+            # 注意：raw level 是线性 RMS。正常说话时蓝牙麦克风只有 0.002~0.03，
+            # 若直接按 level 比例画条，200px 的条只会亮 0~6px —— 看起来就是「没反应」。
+            # 所以这里用 dB 映射 + 噪声地板，再做快起慢落平滑和峰值保持。
             in_level = self.engine.input_level
             out_level = self.engine.output_level
-            self._draw_meter(self.input_meter_canvas, in_level)
-            self._draw_meter(self.output_meter_canvas, out_level)
+            in_ratio = self._level_to_ratio(in_level)
+            out_ratio = self._level_to_ratio(out_level)
+
+            self._meter_smooth('in', in_ratio)
+            self._meter_smooth('out', out_ratio)
+
+            self._draw_meter(self.input_meter_canvas, self._meter_display['in'],
+                             peak=self._meter_peak['in'])
+            self._draw_meter(self.output_meter_canvas, self._meter_display['out'],
+                             peak=self._meter_peak['out'])
 
             # 更新 dB 值
             in_db = self._level_to_db(in_level)
@@ -1305,8 +1320,61 @@ class MainWindow:
             text=f"当前陷波 ({len(freqs)} 个)：{text}",
             fg=self.COLOR_WARNING)
 
-    def _draw_meter(self, canvas: tk.Canvas, level: float):
-        """绘制电平表"""
+    # ---------- 电平表：dB 映射 / 弹道 / 峰值保持 ----------
+
+    # 噪声地板与满刻度：低于 -70dBFS 视为无声，0dBFS 为满格。
+    # 地板取 -70 而非 -60：蓝牙 HFP 麦克风电平天然偏低（正常说话常在
+    # -45 ~ -65 dBFS），若地板是 -60，说话时电平条仍会基本不动。
+    METER_FLOOR_DB = -70.0
+    METER_CEIL_DB = 0.0
+    # 快起慢落：上升立即跟随（防漏掉字首），下降按每帧比例衰减
+    METER_ATTACK = 1.0
+    METER_RELEASE = 0.25
+    # 峰值保持衰减（每帧）
+    METER_PEAK_DECAY = 0.012
+
+    def _ensure_meter_state(self):
+        """惰性初始化电平表状态（在 __init__ 之外做，避免改动构造函数）"""
+        if not hasattr(self, '_meter_display'):
+            self._meter_display = {'in': 0.0, 'out': 0.0}
+            self._meter_peak = {'in': 0.0, 'out': 0.0}
+            self._meter_peak_hold = {'in': 0, 'out': 0}
+
+    def _level_to_ratio(self, level: float) -> float:
+        """线性 RMS → 0.0~1.0 的显示比例（dB 映射）"""
+        if level <= 1e-7:
+            return 0.0
+        import math
+        db = 20.0 * math.log10(level)
+        span = self.METER_CEIL_DB - self.METER_FLOOR_DB
+        ratio = (db - self.METER_FLOOR_DB) / span
+        return max(0.0, min(1.0, ratio))
+
+    def _meter_smooth(self, key: str, target: float):
+        """对电平做快起慢落平滑，并维护峰值保持"""
+        self._ensure_meter_state()
+        cur = self._meter_display[key]
+
+        if target >= cur:
+            cur = cur + (target - cur) * self.METER_ATTACK
+        else:
+            cur = cur + (target - cur) * self.METER_RELEASE
+            if cur < 0.001:
+                cur = 0.0
+        self._meter_display[key] = cur
+
+        # 峰值保持：更新则重置保持计时，之后缓慢下落
+        if cur >= self._meter_peak[key]:
+            self._meter_peak[key] = cur
+            self._meter_peak_hold[key] = 12  # 约 0.36s
+        else:
+            if self._meter_peak_hold[key] > 0:
+                self._meter_peak_hold[key] -= 1
+            else:
+                self._meter_peak[key] = max(cur, self._meter_peak[key] - self.METER_PEAK_DECAY)
+
+    def _draw_meter(self, canvas: tk.Canvas, ratio: float, peak: float = 0.0):
+        """绘制电平表（ratio 已是 0~1 的显示比例）"""
         canvas.update_idletasks()
         width = canvas.winfo_width()
         height = canvas.winfo_height()
@@ -1319,17 +1387,24 @@ class MainWindow:
         # 背景
         canvas.create_rectangle(0, 0, width, height, fill=self.COLOR_METER_BG, outline="")
 
-        # 电平填充
-        fill_width = int(min(level, 1.0) * width)
+        # 电平填充（按 dB 映射，低电平也能看见明显长度）
+        fill_width = int(min(max(ratio, 0.0), 1.0) * width)
         if fill_width > 0:
-            # 渐变色：绿 -> 黄 -> 红
-            if level < 0.6:
+            # 渐变色：绿 -> 黄 -> 红（阈值对齐 dB 刻度，约 -12dB / -3dB）
+            if ratio < 0.8:
                 fill_color = self.COLOR_METER_PEAK
-            elif level < 0.85:
+            elif ratio < 0.95:
                 fill_color = self.COLOR_WARNING
             else:
                 fill_color = self.COLOR_DANGER
             canvas.create_rectangle(0, 0, fill_width, height, fill=fill_color, outline="")
+
+        # 峰值保持刻线
+        if peak > 0.01:
+            px = int(min(peak, 1.0) * (width - 2))
+            px = max(1, min(width - 2, px))
+            canvas.create_rectangle(px, 0, px + 2, height,
+                                    fill=self.COLOR_TEXT, outline="")
 
     def _level_to_db(self, level: float) -> str:
         """电平转 dB 显示"""

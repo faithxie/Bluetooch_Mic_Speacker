@@ -1,14 +1,25 @@
 """
-主窗口 - 音频路由控制面板
-使用 Tkinter 构建专业的音频路由界面
+主窗口 - 深色重设计版
+按「蓝牙音频路由-界面重设计」设计稿实现：
+
+  ┌ 顶栏：图标 + 标题/副标题 + 运行状态胶囊
+  ├ 控制卡：大号「开始路由」按钮 + 「跟随系统默认设备」开关
+  ├ 信号链路：输入面板 → 输出面板（并排，中间蓝色箭头）
+  ├ 实时监测：输入/输出渐变电平条 + 延迟/缓冲/丢失统计
+  ├ 防啸叫 · 回音消除：移频 / 自适应陷波 / 噪声门（开关+滑杆）
+  ├ 音量：麦克风增益 / 扬声器音量（设计稿未画，功能保留故收紧为一小块）
+  └ 底栏：滚动提示 · WASAPI v2.0
+
+交互控件（开关/滑杆/电平条）为自绘 Canvas 部件，
+以贴近设计稿的圆角、配色与手感。
 """
-import tkinter as tk
-from tkinter import ttk, messagebox
-import json
+import math
 import os
 import threading
-import time
-from typing import List, Optional
+from typing import List
+from tkinter import ttk, messagebox
+
+import tkinter as tk
 
 from ..models.audio_device import AudioDeviceInfo
 from ..services.device_manager import DeviceManager
@@ -16,23 +27,227 @@ from ..services.audio_router import AudioRouterEngine
 from ..services.paths import data_file, asset_path, is_frozen
 
 
-class MainWindow:
-    """音频路由主窗口"""
+# ============================================================
+# 设计稿色板
+# ============================================================
+COLOR_PAGE = "#0b0f15"        # 页面背景（近黑，带蓝调）
+COLOR_PANEL = "#141b24"       # 面板底
+COLOR_FIELD = "#0d131b"       # 输入控件（下拉框）底
+COLOR_BORDER = "#223041"      # 面板描边
+COLOR_TRACK = "#1d2733"       # 电平条 / 滑杆轨道
+COLOR_PILL = "#18202b"        # 胶囊 / 徽章底
+COLOR_BADGE_BG = "#17293f"    # 「系统默认」徽章底
 
-    # 颜色主题
-    COLOR_BG = "#1e1e2e"
-    COLOR_PANEL = "#2a2a3e"
-    COLOR_ACCENT = "#4f8ff7"
-    COLOR_ACCENT_HOVER = "#6ba0ff"
-    COLOR_SUCCESS = "#22c55e"
-    COLOR_DANGER = "#ef4444"
-    COLOR_WARNING = "#f59e0b"
-    COLOR_TEXT = "#e4e4e7"
-    COLOR_TEXT_SECONDARY = "#a1a1aa"
-    COLOR_METER_BG = "#3f3f5a"
-    COLOR_METER_FILL = "#4f8ff7"
-    COLOR_METER_PEAK = "#22c55e"
-    COLOR_BORDER = "#3f3f5a"
+COLOR_ACCENT = "#2f7df6"      # 主蓝
+COLOR_ACCENT_HI = "#4a90ff"
+COLOR_TEXT = "#e9eef5"        # 主文字
+COLOR_TEXT_2 = "#93a0b0"      # 次级文字
+COLOR_TEXT_3 = "#5f6b7a"      # 弱化文字
+
+COLOR_GREEN = "#41d98d"       # 成功 / 运行中
+COLOR_GREEN_BG = "#10261b"    # 绿色横幅底
+COLOR_ORANGE = "#f0a13c"      # 警示
+COLOR_RED = "#f0503c"         # 危险（停止按钮 / 高电平）
+COLOR_METER_YELLOW = "#f5c542"
+COLOR_METER_GREEN = "#2fd06b"
+
+FONT = "Microsoft YaHei UI"
+MONO = "Consolas"
+
+
+def _lerp_color(c1: str, c2: str, t: float) -> str:
+    """两个 #rrggbb 颜色按 t∈[0,1] 线性插值"""
+    t = max(0.0, min(1.0, t))
+    r1, g1, b1 = int(c1[1:3], 16), int(c1[3:5], 16), int(c1[5:7], 16)
+    r2, g2, b2 = int(c2[1:3], 16), int(c2[3:5], 16), int(c2[5:7], 16)
+    r = int(r1 + (r2 - r1) * t)
+    g = int(g1 + (g2 - g1) * t)
+    b = int(b1 + (b2 - b1) * t)
+    return f"#{r:02x}{g:02x}{b:02x}"
+
+
+# ============================================================
+# 自绘部件
+# ============================================================
+class RoundedPanel(tk.Canvas):
+    """圆角面板：Canvas 画圆角矩形打底，inner Frame 承载内容
+
+    高度随内容自适应（inner Configure -> 调 Canvas 高度），
+    宽度随父容器拉伸（Canvas Configure -> 拉宽 inner）。
+    """
+
+    def __init__(self, master, radius=14, pad=14,
+                 bg=COLOR_PANEL, border=COLOR_BORDER, **kw):
+        super().__init__(master, bg=COLOR_PAGE, highlightthickness=0, bd=0, **kw)
+        self._radius = radius
+        self._pad = pad
+        self._pbg = bg
+        self._pborder = border
+        self.inner = tk.Frame(self, bg=bg)
+        self._win = self.create_window(pad, pad, window=self.inner, anchor="nw")
+        self.inner.bind("<Configure>", self._on_inner_configure)
+        self.bind("<Configure>", self._on_panel_configure)
+
+    def _on_inner_configure(self, event):
+        want = event.height + 2 * self._pad
+        if abs(self.winfo_height() - want) > 1:
+            self.configure(height=want)
+        self._draw()
+
+    def _on_panel_configure(self, event):
+        want = event.width - 2 * self._pad
+        if want > 1:
+            self.itemconfigure(self._win, width=want)
+        self._draw()
+
+    def _draw(self):
+        # 只重画背景多边形（tag="bg"）。
+        # 绝不能 delete("all") —— 那会把 __init__ 里创建的内容窗口项
+        # （inner Frame）一起删掉，面板从此只剩一个空壳、高度也锁死在默认值。
+        self.delete("bg")
+        w = self.winfo_width()
+        h = self.winfo_height()
+        if w <= 4 or h <= 4:
+            return
+        r = min(self._radius, w // 2, h // 2)
+        pts = [r, 0, w - r, 0, w, 0, w, r, w, h - r, w, h,
+               w - r, h, r, h, 0, h, 0, h - r, 0, r, 0, 0]
+        self.create_polygon(pts, smooth=True, fill=self._pbg,
+                            outline=self._pborder, width=1, tags="bg")
+        # 把内容窗口提到背景之上（Canvas 按创建顺序叠放，
+        # 新画的 polygon 默认盖在先创建的内容窗口上面）
+        self.tag_raise(self._win)
+
+
+class ToggleSwitch(tk.Canvas):
+    """iOS 风格拨动开关（自绘）"""
+
+    def __init__(self, master, var: tk.BooleanVar, command=None,
+                 width=42, height=22, bg=COLOR_PANEL):
+        super().__init__(master, width=width, height=height, bg=bg,
+                         highlightthickness=0, bd=0, cursor="hand2")
+        self._var = var
+        self._cmd = command
+        # 注意：绝不能用 self._w 存宽度 —— 那是 Tkinter 内部的控件路径属性，
+        # 覆盖后 pack() 拿到的是数字而不是窗口名，直接报
+        # TclError: bad argument "42": must be name of window
+        self._tw = width
+        self._th = height
+        self.bind("<Button-1>", self._on_click)
+        self.bind("<Configure>", lambda e: self._draw())
+
+    def _on_click(self, _event):
+        self._var.set(not self._var.get())
+        self._draw()
+        if self._cmd:
+            self._cmd()
+
+    def refresh(self):
+        """外部改 var 后调用，同步外观"""
+        self._draw()
+
+    def _draw(self):
+        w, h = self._tw, self._th
+        self.delete("all")
+        r = h / 2
+        on = self._var.get()
+        track = COLOR_ACCENT if on else "#2a3644"
+        self.create_line(r, r, w - r, r, width=h, capstyle="round", fill=track)
+        kx = w - r if on else r
+        self.create_oval(kx - r + 3, 3, kx + r - 3, h - 3,
+                         fill="#ffffff", outline="")
+
+
+class CanvasSlider(tk.Canvas):
+    """细轨道 + 圆形滑钮的自绘滑杆（贴设计稿样式）
+
+    兼容旧代码习惯：
+      - .config(state='disabled'/'normal') 置灰禁用
+      - command(value) 在用户拖动时回调（传 float）
+    """
+
+    def __init__(self, master, var: tk.DoubleVar, lo, hi,
+                 command=None, resolution=None, height=22, bg=COLOR_PANEL):
+        super().__init__(master, height=height, bg=bg,
+                         highlightthickness=0, bd=0, cursor="hand2")
+        self._var = var
+        self._lo = float(lo)
+        self._hi = float(hi)
+        self._cmd = command
+        self._res = resolution
+        self._state = "normal"
+        self.bind("<Configure>", lambda e: self._draw())
+        self.bind("<Button-1>", self._on_event)
+        self.bind("<B1-Motion>", self._on_event)
+
+    # ---- 兼容 .config(state=...) ----
+    def config(self, **kw):  # noqa: A003 - 有意覆盖
+        if "state" in kw:
+            self._state = kw.pop("state")
+            self._draw()
+        super().config(**kw)
+
+    def set_enabled(self, enabled: bool):
+        self.config(state="normal" if enabled else "disabled")
+
+    # ---- 交互 ----
+    def _on_event(self, event):
+        if self._state != "normal":
+            return
+        w = self.winfo_width()
+        pad = 10
+        span = max(1, w - 2 * pad)
+        frac = min(1.0, max(0.0, (event.x - pad) / span))
+        v = self._lo + frac * (self._hi - self._lo)
+        if self._res:
+            v = round(v / self._res) * self._res
+        v = min(self._hi, max(self._lo, v))
+        if abs(v - self._var.get()) > 1e-9:
+            self._var.set(v)
+            self._draw()
+            if self._cmd:
+                self._cmd(v)
+
+    # ---- 绘制 ----
+    def _draw(self):
+        w = self.winfo_width()
+        h = self.winfo_height()
+        if w <= 4 or h <= 4:
+            return
+        self.delete("all")
+        mid = h / 2
+        pad = 10
+        disabled = self._state != "normal"
+
+        frac = (self._var.get() - self._lo) / (self._hi - self._lo)
+        frac = min(1.0, max(0.0, frac))
+        x = pad + frac * (w - 2 * pad)
+
+        track = COLOR_TRACK
+        fill = "#33445a" if disabled else COLOR_ACCENT
+        knob = "#6b7787" if disabled else "#ffffff"
+
+        self.create_line(pad, mid, w - pad, mid, width=4,
+                         capstyle="round", fill=track)
+        if x > pad + 2:
+            self.create_line(pad, mid, x, mid, width=4,
+                             capstyle="round", fill=fill)
+        self.create_oval(x - 7, mid - 7, x + 7, mid + 7,
+                         fill=knob, outline=fill, width=2)
+
+
+# ============================================================
+# 主窗口
+# ============================================================
+class MainWindow:
+    """音频路由主窗口（深色重设计版）"""
+
+    # 电平表参数（沿用电平修复版：dB 地板 + 快起慢落 + 峰值保持）
+    METER_FLOOR_DB = -70.0
+    METER_CEIL_DB = 0.0
+    METER_ATTACK = 1.0
+    METER_RELEASE = 0.25
+    METER_PEAK_DECAY = 0.012
 
     def __init__(self):
         # 核心引擎
@@ -53,35 +268,21 @@ class MainWindow:
         # 创建窗口
         self.root = tk.Tk()
         self.root.title("蓝牙音频路由 - Bluetooth Audio Router")
-        self.root.configure(bg=self.COLOR_BG)
+        self.root.configure(bg=COLOR_PAGE)
 
-        # 窗口尺寸：按屏幕可用高度自适应
-        # 界面内容总高约 1020px，而 1080p 屏幕减去标题栏/任务栏后放不下
-        # → 采用「固定顶部（标题+开始按钮）+ 中间可滚动 + 底部提示」布局。
-        # 这里让窗口尽量高但不超出屏幕，保证中间滚动区有足够可视高度。
+        # 窗口尺寸：按屏幕可用高度自适应（内容一屏为主，超出可滚动）
         scr_w = self.root.winfo_screenwidth()
         scr_h = self.root.winfo_screenheight()
-
-        # 估算屏幕可用高度：减去标题栏(~40) 与任务栏(~60) 的余量。
-        # Tk 没有跨平台获取工作区的接口，用固定余量是业界常规做法。
         avail_h = scr_h - 110
-        win_h = int(min(900, max(520, avail_h)))
-        win_w = int(min(660, max(560, scr_w - 240)))
-
-        # 水平居中、垂直略偏上（视觉更自然）
+        win_h = int(min(920, max(520, avail_h)))
+        win_w = int(min(780, max(600, scr_w - 200)))
         pos_x = max(0, (scr_w - win_w) // 2)
         pos_y = max(0, (avail_h - win_h) // 2 + 20)
         self.root.geometry(f"{win_w}x{win_h}+{pos_x}+{pos_y}")
-        # 最小尺寸放宽，确保小屏也能把窗口缩到可用大小
-        self.root.minsize(520, 400)
-        self.root.configure(bg=self.COLOR_BG)
+        self.root.minsize(560, 420)
 
-        # 设置样式
+        # 样式
         self._setup_styles()
-
-        # 提示文字的初始换行宽度与注册表（供 _on_window_resize 统一调整）
-        self._hint_wrap = max(320, win_w - 110)
-        self._hint_labels = []
 
         # 构建界面
         self._build_ui()
@@ -92,281 +293,472 @@ class MainWindow:
         # 启动 UI 刷新定时器
         self._update_ui()
 
-        # 初始化与「开关」联动的控件状态
-        # （移频/噪声门/侧链默认关闭 → 对应滑块起步即为禁用态）
+        # 与「开关」联动的控件状态 + 引擎初值同步
         self._sync_control_states()
 
         # 窗口关闭事件
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
-        # 窗口尺寸变化时调整提示文字换行宽度（减少需要滚动的距离）
-        self.root.bind('<Configure>', self._on_window_resize)
-
-    def _sync_control_states(self):
-        """根据各开关的初始值同步关联滑块的启用状态
-
-        避免出现「开关是关的、滑块却可拖动」的误导状态。
-        """
-        self.freq_shift_slider.config(
-            state='normal' if self.freq_shift_var.get() else 'disabled')
-        self.noise_gate_check.select() if self.noise_gate_var.get() \
-            else self.noise_gate_check.deselect()
-        self.gate_threshold_slider.config(
-            state='normal' if self.noise_gate_var.get() else 'disabled')
-        self.notch_slider.config(
-            state='normal' if self.notch_var.get() else 'disabled')
-        self.sidechain_slider.config(
-            state='normal' if self.sidechain_var.get() else 'disabled')
-
-        # 把 UI 初值推送到引擎，确保「界面显示」与「引擎实际值」一致
-        self.engine.set_input_gain(self.input_gain_var.get() / 100.0)
-        self.engine.set_volume(self.volume_var.get() / 100.0)
-        self.engine.set_freq_shift_enabled(self.freq_shift_var.get())
-        self.engine.set_freq_shift_amount(self.freq_shift_amount_var.get())
-        self.engine.set_noise_gate_enabled(self.noise_gate_var.get())
-        self.engine.set_sidechain_enabled(self.sidechain_var.get())
-        self.engine.set_notch_enabled(self.notch_var.get())
-        self.engine.set_notch_attenuation_db(self.notch_attenuation_var.get())
-
     # ---------- 样式设置 ----------
 
     def _setup_styles(self):
-        """设置 ttk 样式"""
+        """ttk 样式（clam 主题，深色下拉框 / 滚动条）"""
         style = ttk.Style()
-        style.theme_use('clam')
+        style.theme_use("clam")
 
-        # 全局样式
-        style.configure('TFrame', background=self.COLOR_BG)
-        style.configure('Panel.TFrame', background=self.COLOR_PANEL)
+        style.configure("TFrame", background=COLOR_PAGE)
+        style.configure("TLabel", background=COLOR_PAGE,
+                        foreground=COLOR_TEXT, font=(FONT, 10))
 
-        # 标签
-        style.configure('TLabel', background=self.COLOR_BG, foreground=self.COLOR_TEXT, font=('Segoe UI', 10))
-        style.configure('Panel.TLabel', background=self.COLOR_PANEL, foreground=self.COLOR_TEXT, font=('Segoe UI', 10))
-        style.configure('Title.TLabel', background=self.COLOR_BG, foreground=self.COLOR_TEXT, font=('Segoe UI', 16, 'bold'))
-        style.configure('Subtitle.TLabel', background=self.COLOR_BG, foreground=self.COLOR_TEXT_SECONDARY, font=('Segoe UI', 9))
-        style.configure('PanelTitle.TLabel', background=self.COLOR_PANEL, foreground=self.COLOR_ACCENT, font=('Segoe UI', 11, 'bold'))
-        style.configure('Status.TLabel', background=self.COLOR_PANEL, foreground=self.COLOR_TEXT_SECONDARY, font=('Segoe UI', 9))
-        style.configure('Value.TLabel', background=self.COLOR_PANEL, foreground=self.COLOR_TEXT, font=('Segoe UI', 10, 'bold'))
+        # 下拉框（深色输入框 + 深色箭头区）
+        style.configure("TCombobox",
+                        fieldbackground=COLOR_FIELD,
+                        background=COLOR_FIELD,
+                        foreground=COLOR_TEXT,
+                        bordercolor=COLOR_BORDER,
+                        lightcolor=COLOR_FIELD,
+                        darkcolor=COLOR_FIELD,
+                        borderwidth=1,
+                        arrowcolor=COLOR_TEXT_2,
+                        padding=(8, 5))
+        style.map("TCombobox",
+                  fieldbackground=[("readonly", COLOR_FIELD)],
+                  foreground=[("readonly", COLOR_TEXT)],
+                  bordercolor=[("focus", COLOR_ACCENT)])
 
-        # 下拉框
-        style.configure('TCombobox',
-                        fieldbackground=self.COLOR_BG,
-                        background=self.COLOR_BG,
-                        foreground=self.COLOR_TEXT,
-                        borderwidth=0,
-                        arrowcolor=self.COLOR_ACCENT)
-        style.map('TCombobox',
-                  fieldbackground=[('readonly', self.COLOR_BG)],
-                  foreground=[('readonly', self.COLOR_TEXT)])
+        # 下拉列表（弹出部分）
+        self.root.option_add("*TCombobox*Listbox.background", COLOR_PANEL)
+        self.root.option_add("*TCombobox*Listbox.foreground", COLOR_TEXT)
+        self.root.option_add("*TCombobox*Listbox.selectBackground", COLOR_ACCENT)
+        self.root.option_add("*TCombobox*Listbox.selectForeground", "#ffffff")
+        self.root.option_add("*TCombobox*Listbox.font", (FONT, 9))
+        self.root.option_add("*TCombobox*Listbox.relief", "flat")
 
-        # 按钮
-        style.configure('TButton',
-                        background=self.COLOR_PANEL,
-                        foreground=self.COLOR_TEXT,
-                        borderwidth=0,
-                        padding=(16, 8),
-                        font=('Segoe UI', 10, 'bold'))
-        style.map('TButton',
-                  background=[('active', self.COLOR_ACCENT), ('pressed', self.COLOR_ACCENT_HOVER)])
-
-        # 主按钮（启动/停止）
-        style.configure('Primary.TButton',
-                        background=self.COLOR_ACCENT,
-                        foreground='white',
-                        borderwidth=0,
-                        padding=(20, 12),
-                        font=('Segoe UI', 12, 'bold'))
-        style.map('Primary.TButton',
-                  background=[('active', self.COLOR_ACCENT_HOVER), ('pressed', '#3d7ae8')])
-
-        # 停止按钮
-        style.configure('Danger.TButton',
-                        background=self.COLOR_DANGER,
-                        foreground='white',
-                        borderwidth=0,
-                        padding=(20, 12),
-                        font=('Segoe UI', 12, 'bold'))
-        style.map('Danger.TButton',
-                  background=[('active', '#f87171'), ('pressed', '#dc2626')])
-
-        # 滑块
-        style.configure('Horizontal.TScale',
-                        background=self.COLOR_PANEL,
-                        troughcolor=self.COLOR_METER_BG,
-                        borderwidth=0)
-
-        # 紧凑滑块：tk.Scale 自带约 40px 的轨道高度，
-        # 在「防啸叫」这种一行一个滑块的密集区域会堆积出大量空白。
-        # ttk.Scale 高度约 20px，配合同行数值标签能省下约一半竖向空间。
-        style.configure('Compact.Horizontal.TScale',
-                        background=self.COLOR_PANEL,
-                        troughcolor=self.COLOR_METER_BG,
-                        borderwidth=0,
-                        lightcolor=self.COLOR_METER_FILL,
-                        darkcolor=self.COLOR_METER_BG)
-        style.map('Compact.Horizontal.TScale',
-                  background=[('active', self.COLOR_PANEL)])
+        # 滚动条（深色）
+        style.configure("Vertical.TScrollbar",
+                        background=COLOR_TRACK,
+                        troughcolor=COLOR_PAGE,
+                        bordercolor=COLOR_PAGE,
+                        lightcolor=COLOR_TRACK,
+                        darkcolor=COLOR_TRACK,
+                        arrowcolor=COLOR_TEXT_3)
+        style.map("Vertical.TScrollbar",
+                  background=[("active", COLOR_BORDER),
+                              ("pressed", COLOR_BORDER)])
 
     # ---------- 界面构建 ----------
 
-    def _compact_slider(self, parent, var, lo, hi, command, text,
-                        label_w=8, value_w=8, resolution=None,
-                        accent=None, fmt='%s'):
-        """创建「说明标签 + 紧凑滑块 + 数值」的横向一行
-
-        与旧写法相比：
-          - tk.Scale 用 width=10 / sliderlength=14 压扁，高度约 40px → 约 18px
-          - 三列宽度固定，多行滑块左右对齐，观感更整齐
-          - 继续用 tk.Scale（而非 ttk.Scale），保证 troughcolor 暗色样式生效
-
-        :param text:    左侧说明文字
-        :param label_w: 左侧说明文字的字符宽度
-        :param value_w: 右侧数值的字符宽度
-        :param fmt:     数值格式化，如 '%d %%' / '%.1f Hz'
-        :return: (滑块, 数值标签)
-        """
-        row = tk.Frame(parent, bg=self.COLOR_PANEL)
-        row.pack(fill=tk.X, pady=(2, 0))
-
-        # 数值标签先 pack 到右侧，保证它始终贴右不被滑块挤压
-        value = tk.Label(row, text=fmt % var.get(),
-                         bg=self.COLOR_PANEL,
-                         fg=accent or self.COLOR_TEXT_SECONDARY,
-                         font=('Consolas', 9), width=value_w, anchor=tk.E)
-        value.pack(side=tk.RIGHT)
-
-        # 左侧说明
-        tk.Label(row, text=text, bg=self.COLOR_PANEL,
-                 fg=self.COLOR_TEXT_SECONDARY,
-                 font=('Segoe UI', 9), width=label_w,
-                 anchor=tk.W).pack(side=tk.LEFT)
-
-        kw = dict(from_=lo, to=hi, orient=tk.HORIZONTAL,
-                  variable=var, command=command,
-                  bg=self.COLOR_PANEL, fg=self.COLOR_TEXT,
-                  troughcolor=self.COLOR_METER_BG,
-                  activebackground=accent or '#f59e0b',
-                  highlightthickness=0, bd=0,
-                  showvalue=False,
-                  width=10, sliderlength=14,
-                  font=('Segoe UI', 9))
-        if resolution is not None:
-            kw['resolution'] = resolution   # tk.Scale 原生支持步进
-        scale = tk.Scale(row, **kw)
-        scale.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 8))
-        return scale, value
-
-    def _hint(self, parent, text):
-        """创建一个「帮助提示」标签（统一样式，自动按窗口宽度换行）
-
-        统一封装的好处：
-          1. 所有提示文字样式一致
-          2. wraplength 随窗口宽度自适应 —— 窗口变宽时文字少占行数，
-             减少整个界面需要滚动的距离
-        """
-        lbl = tk.Label(parent, text=text,
-                       bg=self.COLOR_PANEL, fg=self.COLOR_TEXT_SECONDARY,
-                       font=('Segoe UI', 8),
-                       anchor=tk.W, justify=tk.LEFT,
-                       wraplength=self._hint_wrap)
-        self._hint_labels.append(lbl)
-        return lbl
-
-    def _on_window_resize(self, event=None):
-        """窗口尺寸变化时更新提示文字的换行宽度"""
-        if event is not None and event.widget is not self.root:
-            return
-        # 内容区宽度 = 窗口宽度 - 左右内边距(20+20) - 滚动条/面板内边距估算
-        new_wrap = max(320, self.root.winfo_width() - 110)
-        if abs(new_wrap - self._hint_wrap) < 20:
-            return                      # 变化很小，不做无谓刷新
-        self._hint_wrap = new_wrap
-        for lbl in self._hint_labels:
-            try:
-                lbl.configure(wraplength=new_wrap)
-            except tk.TclError:
-                pass
-
     def _build_ui(self):
-        """构建主界面
-
-        布局分三层（这是为了适配 1080p 等放不下全部内容的屏幕）：
-            ┌────────────────────────────┐
-            │ 固定：标题区 + 开始/停止按钮 │  ← 始终可见，不被裁切
-            ├────────────────────────────┤
-            │ 可滚动：设备/增益/防啸叫/   │  ← 中间内容超出时出现滚动条，
-            │         电平/状态            │     支持鼠标滚轮与触控板
-            ├────────────────────────────┤
-            │ 固定：底部提示              │
-            └────────────────────────────┘
-
-        说明：把「开始路由」按钮移到顶部固定区，是因为它是最重要的操作 ——
-        绝不能因为窗口不够高而看不到。
-        """
-        # ---- 固定顶部：标题 + 主控按钮 ----
-        top = ttk.Frame(self.root, style='TFrame', padding=(20, 12, 20, 8))
-        top.pack(fill=tk.X, side=tk.TOP)
+        """三层布局：固定顶栏 / 可滚动内容 / 固定底栏"""
+        # ---- 固定顶部：标题 + 控制卡 ----
+        top = tk.Frame(self.root, bg=COLOR_PAGE)
+        top.pack(fill=tk.X, side=tk.TOP, padx=24, pady=(16, 0))
 
         self._build_header(top)
         self._build_control_section(top)
 
         # ---- 可滚动中间区 ----
-        # 注意 pack 顺序：先把随窗口伸缩的滚动区放进去（expand=True），
-        # 再放底部提示。若顺序反了，底部提示会被挤到中间。
         self._build_scroll_area()
-
-        # 所有内容区都挂到 self._scroll_content 上
         main = self._scroll_content
 
-        # ---- 输入设备区 ----
-        self._build_input_section(main)
+        # 「信号链路」小节标题
+        self._build_section_label(main, "信号链路")
 
-        # ---- 输出设备区 ----
-        self._build_output_section(main)
+        # 输入 → 输出 并排面板
+        self._build_signal_chain(main)
 
-        # ---- 电平表区（紧跟设备区，方便边说话边看电平）----
-        self._build_meter_section(main)
+        # 实时监测
+        self._build_monitor_panel(main)
 
-        # ---- 状态信息区 ----
-        self._build_status_section(main)
+        # 防啸叫 · 回音消除
+        self._build_antifeedback_panel(main)
 
-        # ---- 防啸叫控制区 ----
-        self._build_antifeedback_section(main)
+        # 音量（设计稿未画，功能保留，收紧为一小块）
+        self._build_volume_panel(main)
 
-        # ---- 音量控制区（麦克风增益 / 扬声器音量）置底 ----
-        self._build_volume_section(main)
+        # ---- 固定底栏 ----
+        self._build_footer()
 
-        # ---- 固定底部提示（必须在滚动区之后 pack）----
-        self._build_footer_hint()
+    def _build_header(self, parent):
+        """顶栏：图标 + 标题/副标题 + 状态胶囊"""
+        header = tk.Frame(parent, bg=COLOR_PAGE)
+        header.pack(fill=tk.X)
 
-    def _build_footer_hint(self):
-        """固定底部提示条：告知中间区域可滚动
+        # 蓝色圆角方块图标（Canvas 自绘）
+        icon = tk.Canvas(header, width=40, height=40, bg=COLOR_PAGE,
+                         highlightthickness=0, bd=0)
+        icon.pack(side=tk.LEFT)
+        icon.create_polygon([10, 0, 30, 0, 40, 0, 40, 10, 40, 30, 40, 40,
+                             30, 40, 10, 40, 0, 40, 0, 30, 0, 10, 0, 0],
+                            smooth=True, fill=COLOR_ACCENT, outline="")
+        icon.create_text(20, 21, text="🎧", font=(FONT, 15), fill="#ffffff")
 
-        没有这个提示，用户看到内容被截断会以为「程序显示不全」，
-        而不是「需要往下滚」。
+        # 标题 + 副标题
+        text_col = tk.Frame(header, bg=COLOR_PAGE)
+        text_col.pack(side=tk.LEFT, padx=(12, 0))
+        tk.Label(text_col, text="蓝牙音频路由", bg=COLOR_PAGE, fg=COLOR_TEXT,
+                 font=(FONT, 15, "bold"), anchor=tk.W).pack(anchor=tk.W)
+        tk.Label(text_col, text="蓝牙耳机麦克风 → 扬声器 / HDMI 实时监听",
+                 bg=COLOR_PAGE, fg=COLOR_TEXT_3,
+                 font=(FONT, 9), anchor=tk.W).pack(anchor=tk.W, pady=(1, 0))
+
+        # 状态胶囊（右上角）
+        self.status_label = tk.Label(header, text="● 未运行",
+                                     bg=COLOR_PILL, fg=COLOR_TEXT_3,
+                                     font=(FONT, 9, "bold"), padx=12, pady=4)
+        self.status_label.pack(side=tk.RIGHT, pady=(4, 0))
+
+    def _build_control_section(self, parent):
+        """控制卡：开始路由大按钮 + 跟随系统默认开关"""
+        panel = RoundedPanel(parent, radius=16, pad=16)
+        panel.pack(fill=tk.X, pady=(14, 0))
+        inner = panel.inner
+
+        self.start_button = tk.Button(
+            inner, text="▶  开始路由",
+            command=self._toggle_router,
+            bg=COLOR_ACCENT, fg="#ffffff",
+            font=(FONT, 13, "bold"),
+            bd=0, cursor="hand2", relief=tk.FLAT,
+            activebackground=COLOR_ACCENT_HI, activeforeground="#ffffff")
+        self.start_button.pack(fill=tk.X, ipady=9)
+
+        # 跟随系统默认设备：拨动开关 + 标题 + 说明
+        follow_row = tk.Frame(inner, bg=COLOR_PANEL)
+        follow_row.pack(fill=tk.X, pady=(12, 0))
+
+        self.follow_default_var = tk.BooleanVar(
+            value=bool(self._prefs.get("follow_system_default", False)))
+        self.follow_toggle = ToggleSwitch(follow_row, self.follow_default_var,
+                                          command=self._on_follow_default_toggle)
+        self.follow_toggle.pack(side=tk.LEFT)
+
+        text_col = tk.Frame(follow_row, bg=COLOR_PANEL)
+        text_col.pack(side=tk.LEFT, padx=(10, 0))
+        tk.Label(text_col, text="跟随系统默认设备", bg=COLOR_PANEL, fg=COLOR_TEXT,
+                 font=(FONT, 10, "bold"), anchor=tk.W).pack(anchor=tk.W)
+        tk.Label(text_col, text="Windows 声音设置切换默认设备时自动跟随",
+                 bg=COLOR_PANEL, fg=COLOR_TEXT_3,
+                 font=(FONT, 8), anchor=tk.W).pack(anchor=tk.W)
+
+    def _build_section_label(self, parent, text):
+        """小节标题：灰色小字 + 右侧延伸细线"""
+        row = tk.Frame(parent, bg=COLOR_PAGE)
+        row.pack(fill=tk.X, pady=(14, 6))
+        tk.Label(row, text=text, bg=COLOR_PAGE, fg=COLOR_TEXT_3,
+                 font=(FONT, 9)).pack(side=tk.LEFT)
+        tk.Frame(row, bg=COLOR_TRACK, height=1).pack(
+            side=tk.LEFT, fill=tk.X, expand=True, padx=(12, 0), pady=(4, 0))
+
+    def _build_signal_chain(self, parent):
+        """信号链路：输入面板 → 箭头 → 输出面板（并排）"""
+        row = tk.Frame(parent, bg=COLOR_PAGE)
+        row.pack(fill=tk.X)
+        row.columnconfigure(0, weight=1, uniform="chain")
+        row.columnconfigure(2, weight=1, uniform="chain")
+
+        self._build_input_panel(row).grid(row=0, column=0, sticky="nsew")
+
+        arrow = tk.Label(row, text="→", bg=COLOR_PAGE, fg=COLOR_ACCENT,
+                         font=(FONT, 15, "bold"))
+        arrow.grid(row=0, column=1, padx=8, pady=(0, 0))
+
+        self._build_output_panel(row).grid(row=0, column=2, sticky="nsew")
+
+    def _build_input_panel(self, parent):
+        """输入设备面板"""
+        panel = RoundedPanel(parent, radius=14, pad=12)
+        inner = panel.inner
+
+        # 标题行 + 刷新按钮
+        head = tk.Frame(inner, bg=COLOR_PANEL)
+        head.pack(fill=tk.X)
+        tk.Label(head, text="🎤 输入 · 麦克风", bg=COLOR_PANEL,
+                 fg=COLOR_TEXT, font=(FONT, 10, "bold")).pack(side=tk.LEFT)
+        refresh_btn = tk.Button(head, text="↻", command=self._refresh_devices,
+                                bg=COLOR_PANEL, fg=COLOR_TEXT_2,
+                                font=(FONT, 12), bd=0, cursor="hand2",
+                                activebackground=COLOR_PANEL,
+                                activeforeground=COLOR_ACCENT, relief=tk.FLAT)
+        refresh_btn.pack(side=tk.RIGHT)
+
+        # 设备名 + 「系统默认」徽章
+        name_row = tk.Frame(inner, bg=COLOR_PANEL)
+        name_row.pack(fill=tk.X, pady=(10, 0))
+        self.input_name_label = tk.Label(name_row, text="未选择设备",
+                                         bg=COLOR_PANEL, fg=COLOR_TEXT,
+                                         font=(FONT, 10, "bold"), anchor=tk.W)
+        self.input_name_label.pack(side=tk.LEFT)
+        self.input_default_badge = tk.Label(
+            name_row, text="系统默认", bg=COLOR_BADGE_BG, fg="#5aa2ff",
+            font=(FONT, 8), padx=7, pady=2)
+        # 徽章仅在设备是系统默认时显示（见 _on_input_selected）
+
+        # 下拉框
+        self.input_combo = ttk.Combobox(inner, state="readonly", height=10)
+        self.input_combo.pack(fill=tk.X, pady=(8, 0))
+        self.input_combo.bind("<<ComboboxSelected>>", self._on_input_selected)
+
+        # 元信息行：CH 1 · 16.0 kHz · Windows WASAPI
+        self.input_meta_label = tk.Label(inner, text="请选择输入设备",
+                                         bg=COLOR_PANEL, fg=COLOR_TEXT_3,
+                                         font=(MONO, 8), anchor=tk.W)
+        self.input_meta_label.pack(fill=tk.X, pady=(6, 0))
+        return panel
+
+    def _build_output_panel(self, parent):
+        """输出设备面板"""
+        panel = RoundedPanel(parent, radius=14, pad=12)
+        inner = panel.inner
+
+        head = tk.Frame(inner, bg=COLOR_PANEL)
+        head.pack(fill=tk.X)
+        tk.Label(head, text="🔊 输出 · 扬声器 / HDMI", bg=COLOR_PANEL,
+                 fg=COLOR_TEXT, font=(FONT, 10, "bold")).pack(side=tk.LEFT)
+
+        name_row = tk.Frame(inner, bg=COLOR_PANEL)
+        name_row.pack(fill=tk.X, pady=(10, 0))
+        self.output_name_label = tk.Label(name_row, text="未选择设备",
+                                          bg=COLOR_PANEL, fg=COLOR_TEXT,
+                                          font=(FONT, 10, "bold"), anchor=tk.W)
+        self.output_name_label.pack(side=tk.LEFT)
+        self.output_default_badge = tk.Label(
+            name_row, text="系统默认", bg=COLOR_BADGE_BG, fg="#5aa2ff",
+            font=(FONT, 8), padx=7, pady=2)
+
+        self.output_combo = ttk.Combobox(inner, state="readonly", height=10)
+        self.output_combo.pack(fill=tk.X, pady=(8, 0))
+        self.output_combo.bind("<<ComboboxSelected>>", self._on_output_selected)
+
+        self.output_meta_label = tk.Label(inner, text="请选择输出设备",
+                                          bg=COLOR_PANEL, fg=COLOR_TEXT_3,
+                                          font=(MONO, 8), anchor=tk.W)
+        self.output_meta_label.pack(fill=tk.X, pady=(6, 0))
+
+        # 绿色横幅：声音将从哪里播放
+        self.output_target_label = tk.Label(inner, text="🔊 声音将从：未选择",
+                                            bg=COLOR_GREEN_BG, fg=COLOR_GREEN,
+                                            font=(FONT, 9, "bold"),
+                                            anchor=tk.W, padx=10, pady=6)
+        self.output_target_label.pack(fill=tk.X, pady=(10, 0))
+        return panel
+
+    def _build_monitor_panel(self, parent):
+        """实时监测面板：电平条 + 延迟/缓冲/丢失统计"""
+        panel = RoundedPanel(parent, radius=14, pad=12)
+        panel.pack(fill=tk.X, pady=(12, 0))
+        inner = panel.inner
+
+        head = tk.Frame(inner, bg=COLOR_PANEL)
+        head.pack(fill=tk.X)
+        tk.Label(head, text="📈 实时监测", bg=COLOR_PANEL, fg=COLOR_TEXT,
+                 font=(FONT, 10, "bold")).pack(side=tk.LEFT)
+
+        stats = tk.Frame(head, bg=COLOR_PANEL)
+        stats.pack(side=tk.RIGHT)
+        self.latency_label = tk.Label(stats, text="延迟 -- ms", bg=COLOR_PANEL,
+                                      fg=COLOR_TEXT_3, font=(MONO, 8))
+        self.latency_label.pack(side=tk.LEFT, padx=(0, 12))
+        self.buffer_label = tk.Label(stats, text="缓冲 --", bg=COLOR_PANEL,
+                                     fg=COLOR_TEXT_3, font=(MONO, 8))
+        self.buffer_label.pack(side=tk.LEFT, padx=(0, 12))
+        self.xrun_label = tk.Label(stats, text="丢失 0", bg=COLOR_PANEL,
+                                   fg=COLOR_TEXT_3, font=(MONO, 8))
+        self.xrun_label.pack(side=tk.LEFT)
+
+        # 输入电平行
+        in_row = tk.Frame(inner, bg=COLOR_PANEL)
+        in_row.pack(fill=tk.X, pady=(10, 4))
+        tk.Label(in_row, text="输入", bg=COLOR_PANEL, fg=COLOR_TEXT_2,
+                 font=(FONT, 9), width=5, anchor=tk.W).pack(side=tk.LEFT)
+        self.input_meter_value = tk.Label(in_row, text="-∞ dB",
+                                          bg=COLOR_PANEL, fg=COLOR_TEXT,
+                                          font=(MONO, 8), width=8, anchor=tk.E)
+        self.input_meter_value.pack(side=tk.RIGHT)
+        self.input_meter_canvas = tk.Canvas(in_row, height=10,
+                                            bg=COLOR_PANEL,
+                                            highlightthickness=0, bd=0)
+        self.input_meter_canvas.pack(side=tk.LEFT, fill=tk.X, expand=True,
+                                     padx=(6, 8))
+
+        # 输出电平行
+        out_row = tk.Frame(inner, bg=COLOR_PANEL)
+        out_row.pack(fill=tk.X, pady=(4, 0))
+        tk.Label(out_row, text="输出", bg=COLOR_PANEL, fg=COLOR_TEXT_2,
+                 font=(FONT, 9), width=5, anchor=tk.W).pack(side=tk.LEFT)
+        self.output_meter_value = tk.Label(out_row, text="-∞ dB",
+                                           bg=COLOR_PANEL, fg=COLOR_TEXT,
+                                           font=(MONO, 8), width=8, anchor=tk.E)
+        self.output_meter_value.pack(side=tk.RIGHT)
+        self.output_meter_canvas = tk.Canvas(out_row, height=10,
+                                             bg=COLOR_PANEL,
+                                             highlightthickness=0, bd=0)
+        self.output_meter_canvas.pack(side=tk.LEFT, fill=tk.X, expand=True,
+                                      padx=(6, 8))
+
+        # 停止状态下也要画出空轨道（Canvas 首次布局后触发一次）
+        for cvs in (self.input_meter_canvas, self.output_meter_canvas):
+            cvs.bind("<Configure>",
+                     lambda e, c=cvs: (not self.engine.is_running)
+                     and self._draw_meter(c, 0.0))
+
+    def _build_antifeedback_panel(self, parent):
+        """防啸叫 · 回音消除：移频 / 自适应陷波 / 噪声门"""
+        panel = RoundedPanel(parent, radius=14, pad=14)
+        panel.pack(fill=tk.X, pady=(12, 0))
+        inner = panel.inner
+
+        head = tk.Frame(inner, bg=COLOR_PANEL)
+        head.pack(fill=tk.X)
+        tk.Label(head, text="🛡 防啸叫 · 回音消除", bg=COLOR_PANEL,
+                 fg=COLOR_TEXT, font=(FONT, 10, "bold")).pack(side=tk.LEFT)
+        # 抑制门状态胶囊（噪声门开/关/过渡）
+        self.gate_status_label = tk.Label(head, text="抑制门 · 关闭",
+                                          bg=COLOR_PILL, fg=COLOR_TEXT_3,
+                                          font=(FONT, 8, "bold"),
+                                          padx=10, pady=3)
+        self.gate_status_label.pack(side=tk.RIGHT)
+
+        # ---- 1. 移频 ----
+        # 真移频音染很小，但整体音高固定偏移 4Hz，对音乐/较真人声有可感差异
+        # → 默认关闭，由用户按需开启。
+        self.freq_shift_var = tk.BooleanVar(value=False)
+        self._af_group(inner, title="移频",
+                       desc="整体音高偏移 Hz，破坏反馈共振条件",
+                       var=self.freq_shift_var,
+                       command=self._on_freq_shift_toggle)
+        self.freq_shift_amount_var = tk.DoubleVar(value=4.0)
+        self.freq_shift_slider, self.freq_shift_amount_label = self._slider_row(
+            inner, "移频量", self.freq_shift_amount_var, 2, 12,
+            self._on_freq_shift_amount_change,
+            resolution=0.5, value_text="4.0 Hz")
+
+        tk.Frame(inner, bg=COLOR_TRACK, height=1).pack(fill=tk.X, pady=10)
+
+        # ---- 2. 自适应陷波 ----
+        self.notch_var = tk.BooleanVar(value=True)
+        self._af_group(inner, title="自适应陷波",
+                       desc="自动检测啸叫频点并实时抑制",
+                       var=self.notch_var,
+                       command=self._on_notch_toggle)
+        self.notch_attenuation_var = tk.DoubleVar(value=10.0)
+        self.notch_slider, self.notch_attenuation_label = self._slider_row(
+            inner, "衰减深度", self.notch_attenuation_var, 3, 30,
+            self._on_notch_attenuation_change,
+            resolution=1.0, value_text="10 dB")
+
+        # 当前陷波频率（判断「是否误伤自己人声」的直接依据）
+        self.notch_freq_label = tk.Label(inner, text="当前陷波: 无",
+                                         bg=COLOR_PANEL, fg=COLOR_TEXT_3,
+                                         font=(FONT, 8), anchor=tk.W)
+        self.notch_freq_label.pack(fill=tk.X, pady=(6, 0))
+
+        tk.Frame(inner, bg=COLOR_TRACK, height=1).pack(fill=tk.X, pady=10)
+
+        # ---- 3. 噪声门 ----
+        # 按电平判定，字间停顿/气声易被误关门（吞字、喘息）→ 默认关闭。
+        self.noise_gate_var = tk.BooleanVar(value=False)
+        self._af_group(inner, title="噪声门",
+                       desc="低于门限的信号自动静音",
+                       var=self.noise_gate_var,
+                       command=self._on_noise_gate_toggle)
+        self.gate_threshold_var = tk.DoubleVar(value=1.5)
+        self.gate_threshold_slider, self.gate_threshold_label = self._slider_row(
+            inner, "灵敏度", self.gate_threshold_var, 0.5, 10.0,
+            self._on_gate_threshold_change,
+            resolution=0.1, value_text="中")
+        # 噪声门用文字档位表达比裸数字更直观
+        self.gate_threshold_label.config(font=(FONT, 9))
+
+    def _af_group(self, parent, title, desc, var, command):
+        """防啸叫分组头：拨动开关 + 标题 + 说明（说明与标题左对齐）"""
+        row = tk.Frame(parent, bg=COLOR_PANEL)
+        row.pack(fill=tk.X, pady=(0, 2))
+        ToggleSwitch(row, var, command=command).pack(side=tk.LEFT)
+
+        col = tk.Frame(row, bg=COLOR_PANEL)
+        col.pack(side=tk.LEFT, padx=(10, 0))
+        tk.Label(col, text=title, bg=COLOR_PANEL, fg=COLOR_TEXT,
+                 font=(FONT, 10, "bold"), anchor=tk.W).pack(anchor=tk.W)
+        tk.Label(col, text=desc, bg=COLOR_PANEL, fg=COLOR_TEXT_3,
+                 font=(FONT, 8), anchor=tk.W).pack(anchor=tk.W)
+
+    def _slider_row(self, parent, text, var, lo, hi, command,
+                    resolution=None, value_text=""):
+        """「标签 + 滑杆 + 数值」一行（设计稿样式）
+
+        数值标签必须在本函数内以 row 为父容器创建。
+        之前版本在外部以 inner 为父创建、却在这里 pack —— pack 只能由
+        其 master 管理，结果数值全部错位到面板右缘、行内无线。
         """
-        self.footer_hint = tk.Label(
-            self.root,
-            text="↕  可滚动 · 滚轮 / PgUp / PgDn / Home / End",
-            bg=self.COLOR_BG, fg=self.COLOR_TEXT_SECONDARY,
-            font=('Segoe UI', 8), anchor=tk.CENTER)
-        self.footer_hint.pack(fill=tk.X, side=tk.BOTTOM, pady=(2, 5))
+        row = tk.Frame(parent, bg=COLOR_PANEL)
+        row.pack(fill=tk.X, pady=(8, 0))
+
+        value_label = tk.Label(row, text=value_text, bg=COLOR_PANEL,
+                               fg=COLOR_TEXT, font=(MONO, 9), width=8,
+                               anchor=tk.E)
+        value_label.pack(side=tk.RIGHT)
+
+        tk.Label(row, text=text, bg=COLOR_PANEL, fg=COLOR_TEXT_2,
+                 font=(FONT, 9), width=8, anchor=tk.W).pack(side=tk.LEFT)
+
+        slider = CanvasSlider(row, var, lo, hi, command=command,
+                              resolution=resolution)
+        slider.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(4, 8))
+        return slider, value_label
+
+    def _build_volume_panel(self, parent):
+        """音量面板：麦克风增益 / 扬声器音量
+
+        设计稿没有这一块，但两个滑杆是既有功能（且用户此前明确要求置底），
+        故按同一套设计语言收紧保留。
+        """
+        panel = RoundedPanel(parent, radius=14, pad=14)
+        panel.pack(fill=tk.X, pady=(12, 0))
+        inner = panel.inner
+
+        head = tk.Frame(inner, bg=COLOR_PANEL)
+        head.pack(fill=tk.X)
+        tk.Label(head, text="🎚 音量", bg=COLOR_PANEL, fg=COLOR_TEXT,
+                 font=(FONT, 10, "bold")).pack(side=tk.LEFT)
+
+        # 麦克风增益（默认 100%：蓝牙麦克风灵敏度通常已足够，
+        # 额外放大在外放场景会把系统推向啸叫临界点）
+        self.input_gain_var = tk.DoubleVar(value=100.0)
+        self.input_gain_slider, self.input_gain_label = self._slider_row(
+            inner, "麦克风增益", self.input_gain_var, 50, 500,
+            self._on_input_gain_change,
+            resolution=5.0, value_text="100%")
+
+        # 扬声器音量
+        self.volume_var = tk.DoubleVar(value=100.0)
+        self.volume_slider, self.volume_label = self._slider_row(
+            inner, "扬声器音量", self.volume_var, 0, 200,
+            self._on_volume_change,
+            resolution=5.0, value_text="100%")
+
+        tk.Label(inner, text="增益 80~120% 为宜，过高易引发啸叫；要更响请调「扬声器音量」",
+                 bg=COLOR_PANEL, fg=COLOR_TEXT_3,
+                 font=(FONT, 8), anchor=tk.W).pack(fill=tk.X, pady=(8, 0))
+
+    def _build_footer(self):
+        """固定底栏：左滚动提示 / 右版本"""
+        footer = tk.Frame(self.root, bg=COLOR_PAGE)
+        footer.pack(fill=tk.X, side=tk.BOTTOM, padx=24, pady=(2, 8))
+
+        tk.Label(footer, text="🖱 滚动 · 滚轮 / PgUp / PgDn / Home / End",
+                 bg=COLOR_PAGE, fg=COLOR_TEXT_3,
+                 font=(FONT, 8), anchor=tk.W).pack(side=tk.LEFT)
+        tk.Label(footer, text="WASAPI · v2.0",
+                 bg=COLOR_PAGE, fg=COLOR_TEXT_3,
+                 font=(FONT, 8), anchor=tk.E).pack(side=tk.RIGHT)
 
     def _build_scroll_area(self):
-        """构建可滚动的内容区
+        """可滚动内容区（Canvas + 内嵌 Frame 的经典做法）"""
+        outer = tk.Frame(self.root, bg=COLOR_PAGE)
+        outer.pack(fill=tk.BOTH, expand=True, side=tk.TOP, padx=24)
 
-        实现要点（Tkinter 滚动区的经典做法）：
-          1. Canvas 作为视口，内嵌一个 Frame 承载真实内容
-          2. 通过 create_window 把内容 Frame 贴到 Canvas 上
-          3. 内容尺寸变化时同步更新 Canvas 的 scrollregion
-          4. Canvas 宽度变化时，把内容 Frame 宽度拉到与 Canvas 一致
-             （否则内容会保持自身请求宽度，右侧出现空白）
-        """
-        # 外层容器：Canvas + 垂直滚动条
-        outer = tk.Frame(self.root, bg=self.COLOR_BG)
-        outer.pack(fill=tk.BOTH, expand=True, side=tk.TOP)
-
-        self._canvas = tk.Canvas(outer, bg=self.COLOR_BG,
+        self._canvas = tk.Canvas(outer, bg=COLOR_PAGE,
                                  highlightthickness=0, bd=0)
         self._canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
@@ -374,35 +766,21 @@ class MainWindow:
                                         command=self._canvas.yview)
         self._scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         self._scrollbar_visible = True
-
         self._canvas.configure(yscrollcommand=self._on_scrollbar_set)
 
-        # 内容 Frame（所有区块的父容器）
-        self._scroll_content = ttk.Frame(self._canvas, style='TFrame',
-                                         padding=(20, 4, 20, 16))
+        self._scroll_content = tk.Frame(self._canvas, bg=COLOR_PAGE)
         self._content_window = self._canvas.create_window(
-            (0, 0), window=self._scroll_content, anchor='nw')
+            (0, 0), window=self._scroll_content, anchor="nw")
 
-        # 内容尺寸变化 → 更新滚动范围
-        self._scroll_content.bind('<Configure>', self._on_content_configure)
-        # Canvas 尺寸变化 → 内容宽度跟随
-        self._canvas.bind('<Configure>', self._on_canvas_configure)
-
-        # 鼠标滚轮绑定（Windows / macOS）
+        self._scroll_content.bind("<Configure>", self._on_content_configure)
+        self._canvas.bind("<Configure>", self._on_canvas_configure)
         self._bind_mousewheel()
 
     def _on_scrollbar_set(self, first, last):
-        """滚动条位置更新；内容未超出时隐藏滚动条
-
-        用 pack 的副作用做显隐，不能 pack_forget 后重新 pack ——
-        那样会把滚动条排到 Canvas 左边（破坏左右布局）。
-        正确做法：保持 pack 顺序，只用 pack(side=RIGHT) 重新声明是不可靠的，
-        因此这里改为在 _on_content_configure 里统一控制显隐。
-        """
+        """滚动条位置更新；内容未超出时隐藏滚动条"""
         self._scrollbar.set(first, last)
         need = not (float(first) <= 0.0 and float(last) >= 1.0)
         if need and not self._scrollbar_visible:
-            # 重新 pack 时必须显式保证在 Canvas 右侧
             self._scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
             self._scrollbar_visible = True
         elif not need and self._scrollbar_visible:
@@ -410,576 +788,107 @@ class MainWindow:
             self._scrollbar_visible = False
 
     def _on_content_configure(self, event=None):
-        """内容尺寸变化时更新 Canvas 的可滚动范围"""
-        self._canvas.configure(scrollregion=self._canvas.bbox('all'))
+        self._canvas.configure(scrollregion=self._canvas.bbox("all"))
 
     def _on_canvas_configure(self, event):
-        """Canvas 宽度变化时，让内容 Frame 宽度与之一致"""
         self._canvas.itemconfigure(self._content_window, width=event.width)
 
     def _bind_mousewheel(self):
-        """绑定鼠标滚轮
-
-        注意：Tkinter 在 Windows 用 <MouseWheel>（event.delta 为 ±120 的倍数），
-        在 Linux 用 <Button-4>/<Button-5>，这里都做兼容。
-        另外只在指针位于滚动区内时才响应，避免干扰其他控件。
-        """
+        """鼠标滚轮 / 触控板 / 键盘翻页"""
         def _on_wheel(event):
-            # 内容未超出视口时不做任何事
-            bbox = self._canvas.bbox('all')
+            bbox = self._canvas.bbox("all")
             if not bbox or bbox[3] <= self._canvas.winfo_height():
                 return
             if event.delta:
-                self._canvas.yview_scroll(int(-event.delta / 120), 'units')
-            return 'break'
-
-        def _on_wheel_up(event):
-            self._canvas.yview_scroll(-1, 'units')
-            return 'break'
-
-        def _on_wheel_down(event):
-            self._canvas.yview_scroll(1, 'units')
-            return 'break'
-
-        # 绑定到整个窗口，指针在滚动区上方即生效
-        self.root.bind_all('<MouseWheel>', _on_wheel)
-        self.root.bind_all('<Button-4>', _on_wheel_up)
-        self.root.bind_all('<Button-5>', _on_wheel_down)
-
-        # 触控板 / 键盘翻页（更顺手的补充操作）
-        self.root.bind_all('<Prior>', lambda e: self._canvas.yview_scroll(-1, 'pages'))
-        self.root.bind_all('<Next>', lambda e: self._canvas.yview_scroll(1, 'pages'))
-        self.root.bind_all('<Home>', lambda e: self._canvas.yview_moveto(0.0))
-        self.root.bind_all('<End>', lambda e: self._canvas.yview_moveto(1.0))
-
-    def _build_header(self, parent):
-        """标题区（位于固定顶部区域）"""
-        header = ttk.Frame(parent, style='TFrame')
-        header.pack(fill=tk.X, pady=(0, 6))
-
-        ttk.Label(header, text="🎧 蓝牙音频路由", style='Title.TLabel').pack(anchor=tk.W)
-        ttk.Label(header, text="蓝牙耳机麦克风 → 扬声器 / HDMI 实时监听",
-                  style='Subtitle.TLabel').pack(anchor=tk.W, pady=(1, 0))
-
-    def _build_input_section(self, parent):
-        """输入设备选择区"""
-        # 注意：绝不能对设备面板调用 pack_propagate(False)。
-        # 该调用会把面板尺寸冻结在「创建瞬间」的大小（空面板=1px），
-        # 之后加进来的下拉框永远撑不开它 —— 设备选择区会直接消失。
-        panel = tk.Frame(parent, bg=self.COLOR_PANEL,
-                         highlightthickness=1, highlightbackground=self.COLOR_BORDER)
-        panel.pack(fill=tk.X, pady=(0, 6))
-
-        # 内边距
-        inner = tk.Frame(panel, bg=self.COLOR_PANEL, padx=16, pady=8)
-        inner.pack(fill=tk.X)
-
-        # 标题行
-        title_row = tk.Frame(inner, bg=self.COLOR_PANEL)
-        title_row.pack(fill=tk.X)
-
-        tk.Label(title_row, text="🎤 输入设备 (麦克风)",
-                 bg=self.COLOR_PANEL, fg=self.COLOR_ACCENT,
-                 font=('Segoe UI', 11, 'bold')).pack(side=tk.LEFT)
-
-        refresh_btn = tk.Button(title_row, text="🔄 刷新", command=self._refresh_devices,
-                                bg=self.COLOR_PANEL, fg=self.COLOR_TEXT_SECONDARY,
-                                font=('Segoe UI', 9), bd=0, cursor='hand2',
-                                activebackground=self.COLOR_PANEL, activeforeground=self.COLOR_ACCENT)
-        refresh_btn.pack(side=tk.RIGHT)
-
-        # 设备下拉框
-        self.input_combo = ttk.Combobox(inner, state='readonly', height=10)
-        self.input_combo.pack(fill=tk.X, pady=(8, 0))
-        self.input_combo.bind('<<ComboboxSelected>>', self._on_input_selected)
-
-        # 设备信息
-        self.input_info = tk.Label(inner, text="请选择输入设备",
-                                   bg=self.COLOR_PANEL, fg=self.COLOR_TEXT_SECONDARY,
-                                   font=('Segoe UI', 9), anchor=tk.W, justify=tk.LEFT)
-        self.input_info.pack(fill=tk.X, pady=(6, 0))
-
-    def _build_output_section(self, parent):
-        """输出设备选择区"""
-        # 同输入区：不用 pack_propagate(False)，避免面板被冻结成 1px
-        panel = tk.Frame(parent, bg=self.COLOR_PANEL,
-                         highlightthickness=1, highlightbackground=self.COLOR_BORDER)
-        panel.pack(fill=tk.X, pady=(0, 6))
-
-        inner = tk.Frame(panel, bg=self.COLOR_PANEL, padx=16, pady=8)
-        inner.pack(fill=tk.X)
-
-        # 标题行
-        title_row = tk.Frame(inner, bg=self.COLOR_PANEL)
-        title_row.pack(fill=tk.X)
-
-        tk.Label(title_row, text="🔊 输出设备 (扬声器 / HDMI)",
-                 bg=self.COLOR_PANEL, fg=self.COLOR_ACCENT,
-                 font=('Segoe UI', 11, 'bold')).pack(side=tk.LEFT)
-
-        # 设备下拉框
-        self.output_combo = ttk.Combobox(inner, state='readonly', height=10)
-        self.output_combo.pack(fill=tk.X, pady=(8, 0))
-        self.output_combo.bind('<<ComboboxSelected>>', self._on_output_selected)
-
-        # 设备信息
-        self.output_info = tk.Label(inner, text="请选择输出设备",
-                                    bg=self.COLOR_PANEL, fg=self.COLOR_TEXT_SECONDARY,
-                                    font=('Segoe UI', 9), anchor=tk.W, justify=tk.LEFT)
-        self.output_info.pack(fill=tk.X, pady=(6, 0))
-
-        # 醒目提示：当前声音输出到哪里
-        self.output_target_label = tk.Label(inner,
-                                            text="💡 声音将从：未选择",
-                                            bg='#0e4429', fg='#4ade80',
-                                            font=('Segoe UI', 10, 'bold'),
-                                            anchor=tk.W, padx=10, pady=6)
-        self.output_target_label.pack(fill=tk.X, pady=(8, 0))
-
-    def _build_volume_section(self, parent):
-        """音量/增益控制区"""
-        panel = tk.Frame(parent, bg=self.COLOR_PANEL,
-                         highlightthickness=1, highlightbackground=self.COLOR_BORDER)
-        panel.pack(fill=tk.X, pady=(0, 6))
-
-        inner = tk.Frame(panel, bg=self.COLOR_PANEL, padx=16, pady=8)
-        inner.pack(fill=tk.X)
-
-        # 标题
-        tk.Label(inner, text="🎤 麦克风增益（输入放大）",
-                 bg=self.COLOR_PANEL, fg=self.COLOR_ACCENT,
-                 font=('Segoe UI', 11, 'bold')).pack(anchor=tk.W)
-
-        # 输入增益滑块 + 数值
-        # 【改动】默认 200% → 100%。蓝牙麦克风灵敏度通常已足够，
-        # 额外放大在外放场景等同于主动把系统推向啸叫临界点。
-        gain_row = tk.Frame(inner, bg=self.COLOR_PANEL)
-        gain_row.pack(fill=tk.X, pady=(5, 0))
-
-        self.input_gain_var = tk.DoubleVar(value=100.0)  # 默认 100%（不加放大）
-        self.input_gain_slider = tk.Scale(
-            gain_row, from_=50, to=500, orient=tk.HORIZONTAL,
-            variable=self.input_gain_var,
-            command=self._on_input_gain_change,
-            bg=self.COLOR_PANEL, fg=self.COLOR_TEXT,
-            troughcolor=self.COLOR_METER_BG,
-            activebackground=self.COLOR_ACCENT,
-            highlightthickness=0,
-            bd=0,
-            length=300,
-            font=('Segoe UI', 9),
-            showvalue=False
-        )
-        self.input_gain_slider.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 12))
-
-        self.input_gain_label = tk.Label(gain_row, text="100%",
-                                         bg=self.COLOR_PANEL, fg=self.COLOR_TEXT,
-                                         font=('Segoe UI', 11, 'bold'), width=6)
-        self.input_gain_label.pack(side=tk.RIGHT)
-
-        # 增益提示：避免用户把增益当作「音量」无脑拉满
-        self.input_gain_hint = self._hint(
-            inner,
-            "增益 80~120% 为宜，过高易引发啸叫；要更响请调下方「扬声器音量」。")
-        self.input_gain_hint.pack(fill=tk.X, pady=(6, 0))
-
-        # 分隔线
-        tk.Frame(inner, bg=self.COLOR_BORDER, height=1).pack(fill=tk.X, pady=8)
-
-        # 输出音量标题
-        tk.Label(inner, text="🔊 扬声器音量（输出）",
-                 bg=self.COLOR_PANEL, fg=self.COLOR_ACCENT,
-                 font=('Segoe UI', 11, 'bold')).pack(anchor=tk.W)
-
-        # 音量滑块 + 数值
-        vol_row = tk.Frame(inner, bg=self.COLOR_PANEL)
-        vol_row.pack(fill=tk.X, pady=(5, 0))
-
-        self.volume_var = tk.DoubleVar(value=100.0)
-        self.volume_slider = tk.Scale(
-            vol_row, from_=0, to=200, orient=tk.HORIZONTAL,
-            variable=self.volume_var,
-            command=self._on_volume_change,
-            bg=self.COLOR_PANEL, fg=self.COLOR_TEXT,
-            troughcolor=self.COLOR_METER_BG,
-            activebackground=self.COLOR_ACCENT,
-            highlightthickness=0,
-            bd=0,
-            length=300,
-            font=('Segoe UI', 9),
-            showvalue=False
-        )
-        self.volume_slider.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 12))
-
-        self.volume_label = tk.Label(vol_row, text="100%",
-                                     bg=self.COLOR_PANEL, fg=self.COLOR_TEXT,
-                                     font=('Segoe UI', 11, 'bold'), width=6)
-        self.volume_label.pack(side=tk.RIGHT)
-
-    def _build_antifeedback_section(self, parent):
-        """防啸叫/回音消除控制区（4 级防护）"""
-        panel = tk.Frame(parent, bg=self.COLOR_PANEL,
-                         highlightthickness=1, highlightbackground=self.COLOR_BORDER)
-        panel.pack(fill=tk.X, pady=(0, 6))
-
-        inner = tk.Frame(panel, bg=self.COLOR_PANEL, padx=16, pady=8)
-        inner.pack(fill=tk.X)
-
-        # 标题行
-        title_row = tk.Frame(inner, bg=self.COLOR_PANEL)
-        title_row.pack(fill=tk.X)
-
-        tk.Label(title_row, text="🛡️  防啸叫 / 回音消除",
-                 bg=self.COLOR_PANEL, fg='#f59e0b',
-                 font=('Segoe UI', 11, 'bold')).pack(side=tk.LEFT)
-
-        # 状态指示器
-        self.gate_status_label = tk.Label(title_row, text="  🔇 门关闭",
-                                          bg=self.COLOR_PANEL, fg='#6b7280',
-                                          font=('Segoe UI', 9, 'bold'))
-        self.gate_status_label.pack(side=tk.RIGHT)
-
-        # --- 1. 频谱移频 ---
-        # 【改动】默认由「开启」改为「关闭」。
-        # 真移频虽然音染很小，但会让整体音高固定偏移 4Hz，
-        # 对音乐/较真的人声仍有可感差异 → 改为由用户按需开启。
-        fs_row = tk.Frame(inner, bg=self.COLOR_PANEL)
-        fs_row.pack(fill=tk.X, pady=(6, 0))
-
-        self.freq_shift_var = tk.BooleanVar(value=False)
-        self.freq_shift_check = tk.Checkbutton(
-            fs_row, text="频谱移频（把整体音高偏移几 Hz，破坏反馈共振）",
-            variable=self.freq_shift_var,
-            command=self._on_freq_shift_toggle,
-            bg=self.COLOR_PANEL, fg=self.COLOR_TEXT,
-            selectcolor=self.COLOR_BG,
-            activebackground=self.COLOR_PANEL,
-            activeforeground=self.COLOR_TEXT,
-            font=('Segoe UI', 9, 'bold'),
-            bd=0, highlightthickness=0
-        )
-        self.freq_shift_check.pack(anchor=tk.W)
-
-        # 移频量滑块（紧凑行：说明 + 滑块 + 数值 同一行）
-        # 【改动】默认 5Hz → 4Hz（文献与工程共识区间 3~5Hz）
-        self.freq_shift_amount_var = tk.DoubleVar(value=4.0)
-        self.freq_shift_slider, self.freq_shift_amount_label = \
-            self._compact_slider(inner, self.freq_shift_amount_var, 2, 12,
-                                 self._on_freq_shift_amount_change,
-                                 text="移频量", resolution=0.5,
-                                 fmt='%.1f Hz', value_w=8)
-
-        # 分隔线
-        tk.Frame(inner, bg=self.COLOR_BORDER, height=1).pack(fill=tk.X, pady=7)
-
-        # --- 2. 自适应陷波 ---
-        notch_row = tk.Frame(inner, bg=self.COLOR_PANEL)
-        notch_row.pack(fill=tk.X)
-
-        self.notch_var = tk.BooleanVar(value=True)
-        self.notch_check = tk.Checkbutton(
-            notch_row, text="自适应陷波（自动检测并消除啸叫频率）",
-            variable=self.notch_var,
-            command=self._on_notch_toggle,
-            bg=self.COLOR_PANEL, fg=self.COLOR_TEXT,
-            selectcolor=self.COLOR_BG,
-            activebackground=self.COLOR_PANEL,
-            activeforeground=self.COLOR_TEXT,
-            font=('Segoe UI', 9),
-            bd=0, highlightthickness=0
-        )
-        self.notch_check.pack(anchor=tk.W)
-
-        # 陷波强度（紧凑行）
-        # 【改动】默认 20dB → 10dB；范围 6~35 → 3~30（与引擎 set_notch_attenuation_db 的 clamp 对齐）
-        # 原因：衰减越深，一旦检测误判对人声的破坏越不可逆（直接把共振峰挖掉）。
-        self.notch_attenuation_var = tk.DoubleVar(value=10.0)
-        self.notch_slider, self.notch_attenuation_label = \
-            self._compact_slider(inner, self.notch_attenuation_var, 3, 30,
-                                 self._on_notch_attenuation_change,
-                                 text="衰减强度", resolution=1.0,
-                                 fmt='%d dB', value_w=8)
-
-        # 实时陷波频率（用于验证是否误伤自己的人声：说话时这里应保持为空）
-        self.notch_freq_label = tk.Label(
-            inner, text="当前陷波：(无)",
-            bg=self.COLOR_PANEL, fg=self.COLOR_TEXT_SECONDARY,
-            font=('Consolas', 8), anchor=tk.W, justify=tk.LEFT,
-            wraplength=self._hint_wrap)
-        self._hint_labels.append(self.notch_freq_label)
-        self.notch_freq_label.pack(fill=tk.X, pady=(3, 0))
-
-        # 分隔线
-        tk.Frame(inner, bg=self.COLOR_BORDER, height=1).pack(fill=tk.X, pady=7)
-
-        # --- 3. 噪声门 ---
-        # 【改动】默认由「开启」改为「关闭」。
-        # 噪声门按电平判定，语音的字间停顿/气声容易被误关门，
-        # 产生「吞字、喘息」的听感。需要时由用户手动开启。
-        gate_row = tk.Frame(inner, bg=self.COLOR_PANEL)
-        gate_row.pack(fill=tk.X)
-
-        self.noise_gate_var = tk.BooleanVar(value=False)
-        self.noise_gate_check = tk.Checkbutton(
-            gate_row, text="噪声门（不说话时自动静音）",
-            variable=self.noise_gate_var,
-            command=self._on_noise_gate_toggle,
-            bg=self.COLOR_PANEL, fg=self.COLOR_TEXT,
-            selectcolor=self.COLOR_BG,
-            activebackground=self.COLOR_PANEL,
-            activeforeground=self.COLOR_TEXT,
-            font=('Segoe UI', 9),
-            bd=0, highlightthickness=0
-        )
-        self.noise_gate_check.pack(anchor=tk.W)
-
-        # 噪声门阈值滑块（紧凑行）
-        self.gate_threshold_var = tk.DoubleVar(value=1.5)
-        self.gate_threshold_slider, self.gate_threshold_label = \
-            self._compact_slider(inner, self.gate_threshold_var, 0.5, 10.0,
-                                 self._on_gate_threshold_change,
-                                 text="灵敏度", resolution=0.1,
-                                 value_w=8)
-        # 噪声门用文字档位表达比裸数字更直观
-        self.gate_threshold_label.configure(text="中")
-
-        # 分隔线
-        tk.Frame(inner, bg=self.COLOR_BORDER, height=1).pack(fill=tk.X, pady=7)
-
-        # --- 4. 侧链抑制 ---
-        # 【改动】默认由「开启」改为「关闭」。
-        # 它用「上一块输出电平」压低输入增益，形成随语音起伏的自动增益，
-        # 听感就是「音量一抽一抽」；且它只能降低啸叫增长速率，
-        # 真正的抑制靠陷波/移频，所以改为默认关闭。
-        sc_row = tk.Frame(inner, bg=self.COLOR_PANEL)
-        sc_row.pack(fill=tk.X)
-
-        self.sidechain_var = tk.BooleanVar(value=False)
-        self.sidechain_check = tk.Checkbutton(
-            sc_row, text="侧链抑制（扬声器有声时压低麦克风）",
-            variable=self.sidechain_var,
-            command=self._on_sidechain_toggle,
-            bg=self.COLOR_PANEL, fg=self.COLOR_TEXT,
-            selectcolor=self.COLOR_BG,
-            activebackground=self.COLOR_PANEL,
-            activeforeground=self.COLOR_TEXT,
-            font=('Segoe UI', 9),
-            bd=0, highlightthickness=0
-        )
-        self.sidechain_check.pack(anchor=tk.W)
-
-        # 侧链强度滑块（紧凑行）
-        self.sidechain_amount_var = tk.DoubleVar(value=60.0)
-        self.sidechain_slider, self.sidechain_amount_label = \
-            self._compact_slider(inner, self.sidechain_amount_var, 10, 90,
-                                 self._on_sidechain_amount_change,
-                                 text="抑制强度", resolution=1.0,
-                                 fmt='%d %%', value_w=8)
-
-        # 四个子项的调参要点合并为一行，替代原先各自一条说明（省下约 3 行高度）
-        tk.Frame(inner, bg=self.COLOR_BORDER, height=1).pack(fill=tk.X, pady=7)
-        self._hint(
-            inner,
-            "推荐值：移频 3~5Hz（真移频非颤音） · 陷波 6~12dB（只消孤立窄峰） · "
-            "噪声门 8/120/150ms（字间停顿不吞字） · 侧链仅压制增长速率，非必需。"
-        ).pack(fill=tk.X, pady=(0, 1))
-
-    def _build_meter_section(self, parent):
-        """电平表区"""
-        panel = tk.Frame(parent, bg=self.COLOR_PANEL,
-                         highlightthickness=1, highlightbackground=self.COLOR_BORDER)
-        panel.pack(fill=tk.X, pady=(0, 6))
-
-        inner = tk.Frame(panel, bg=self.COLOR_PANEL, padx=16, pady=8)
-        inner.pack(fill=tk.X)
-
-        # 标题
-        tk.Label(inner, text="📊 实时电平",
-                 bg=self.COLOR_PANEL, fg=self.COLOR_ACCENT,
-                 font=('Segoe UI', 11, 'bold')).pack(anchor=tk.W)
-
-        # 输入电平
-        in_row = tk.Frame(inner, bg=self.COLOR_PANEL)
-        in_row.pack(fill=tk.X, pady=(6, 4))
-
-        tk.Label(in_row, text="输入", bg=self.COLOR_PANEL, fg=self.COLOR_TEXT_SECONDARY,
-                 font=('Segoe UI', 9), width=6, anchor=tk.W).pack(side=tk.LEFT)
-
-        self.input_meter_canvas = tk.Canvas(in_row, height=16, bg=self.COLOR_METER_BG,
-                                            highlightthickness=0, bd=0)
-        self.input_meter_canvas.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 0))
-
-        self.input_meter_value = tk.Label(in_row, text="-∞ dB",
-                                          bg=self.COLOR_PANEL, fg=self.COLOR_TEXT,
-                                          font=('Consolas', 9), width=8, anchor=tk.E)
-        self.input_meter_value.pack(side=tk.RIGHT, padx=(8, 0))
-
-        # 输出电平
-        out_row = tk.Frame(inner, bg=self.COLOR_PANEL)
-        out_row.pack(fill=tk.X, pady=(4, 0))
-
-        tk.Label(out_row, text="输出", bg=self.COLOR_PANEL, fg=self.COLOR_TEXT_SECONDARY,
-                 font=('Segoe UI', 9), width=6, anchor=tk.W).pack(side=tk.LEFT)
-
-        self.output_meter_canvas = tk.Canvas(out_row, height=16, bg=self.COLOR_METER_BG,
-                                             highlightthickness=0, bd=0)
-        self.output_meter_canvas.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 0))
-
-        self.output_meter_value = tk.Label(out_row, text="-∞ dB",
-                                           bg=self.COLOR_PANEL, fg=self.COLOR_TEXT,
-                                           font=('Consolas', 9), width=8, anchor=tk.E)
-        self.output_meter_value.pack(side=tk.RIGHT, padx=(8, 0))
-
-    def _build_status_section(self, parent):
-        """状态信息区"""
-        panel = tk.Frame(parent, bg=self.COLOR_PANEL,
-                         highlightthickness=1, highlightbackground=self.COLOR_BORDER)
-        panel.pack(fill=tk.X, pady=(0, 2))
-
-        inner = tk.Frame(panel, bg=self.COLOR_PANEL, padx=16, pady=8)
-        inner.pack(fill=tk.X)
-
-        # 标题
-        tk.Label(inner, text="📈 运行状态",
-                 bg=self.COLOR_PANEL, fg=self.COLOR_ACCENT,
-                 font=('Segoe UI', 11, 'bold')).pack(anchor=tk.W)
-
-        # 状态网格
-        grid = tk.Frame(inner, bg=self.COLOR_PANEL)
-        grid.pack(fill=tk.X, pady=(6, 0))
-
-        # 第1行：状态 + 延迟
-        self.status_label = tk.Label(grid, text="● 未运行",
-                                     bg=self.COLOR_PANEL, fg=self.COLOR_TEXT_SECONDARY,
-                                     font=('Segoe UI', 10, 'bold'))
-        self.status_label.grid(row=0, column=0, sticky=tk.W)
-
-        self.latency_label = tk.Label(grid, text="延迟: -- ms",
-                                      bg=self.COLOR_PANEL, fg=self.COLOR_TEXT_SECONDARY,
-                                      font=('Segoe UI', 9))
-        self.latency_label.grid(row=0, column=1, sticky=tk.E)
-
-        # 第2行：缓冲 + 欠载
-        self.buffer_label = tk.Label(grid, text="缓冲: --",
-                                     bg=self.COLOR_PANEL, fg=self.COLOR_TEXT_SECONDARY,
-                                     font=('Segoe UI', 9))
-        self.buffer_label.grid(row=1, column=0, sticky=tk.W, pady=(4, 0))
-
-        self.xrun_label = tk.Label(grid, text="欠载: 0",
-                                   bg=self.COLOR_PANEL, fg=self.COLOR_TEXT_SECONDARY,
-                                   font=('Segoe UI', 9))
-        self.xrun_label.grid(row=1, column=1, sticky=tk.E, pady=(4, 0))
-
-        grid.columnconfigure(0, weight=1)
-        grid.columnconfigure(1, weight=1)
-
-    def _build_control_section(self, parent):
-        """控制按钮区（位于固定顶部区域，始终可见）
-
-        把「开始路由」放在顶部固定区，是为了保证它永远不被窗口高度裁掉 ——
-        这是整个界面最关键的按钮。
-        """
-        btn_frame = tk.Frame(parent, bg=self.COLOR_BG)
-        btn_frame.pack(fill=tk.X, pady=(0, 0))
-
-        self.start_button = tk.Button(
-            btn_frame, text="▶  开始路由",
-            command=self._toggle_router,
-            bg=self.COLOR_ACCENT, fg='white',
-            font=('Segoe UI', 12, 'bold'),
-            bd=0, cursor='hand2',
-            activebackground=self.COLOR_ACCENT_HOVER,
-            activeforeground='white',
-            height=1,
-            relief=tk.FLAT
-        )
-        self.start_button.pack(fill=tk.X)
-
-        # 跟随系统默认设备开关。
-        # 之前程序完全无视 Windows 的默认设备设置：输入硬性优先蓝牙麦克风、
-        # 输出优先 HDMI / 内置扬声器，并且会记住上次手动选择。
-        # 用户改了系统默认却不起作用，就是因为这三条规则在挡。
-        # 勾选此项后，程序会改为跟随 Windows 的默认输入/输出设备。
-        follow_row = tk.Frame(parent, bg=self.COLOR_BG)
-        follow_row.pack(fill=tk.X, pady=(6, 0))
-        self.follow_default_var = tk.BooleanVar(value=bool(self._prefs.get('follow_system_default', False)))
-        tk.Checkbutton(
-            follow_row, text="跟随系统默认设备（Windows 声音设置里改了就跟着变）",
-            variable=self.follow_default_var, command=self._on_follow_default_toggle,
-            bg=self.COLOR_BG, fg=self.COLOR_TEXT_SECONDARY,
-            selectcolor=self.COLOR_PANEL,
-            activebackground=self.COLOR_BG, activeforeground=self.COLOR_TEXT,
-            font=('Segoe UI', 9), bd=0, highlightthickness=0, cursor='hand2'
-        ).pack(anchor=tk.W)
+                self._canvas.yview_scroll(int(-event.delta / 120), "units")
+            return "break"
+
+        self.root.bind_all("<MouseWheel>", _on_wheel)
+        self.root.bind_all("<Button-4>",
+                           lambda e: self._canvas.yview_scroll(-1, "units"))
+        self.root.bind_all("<Button-5>",
+                           lambda e: self._canvas.yview_scroll(1, "units"))
+        self.root.bind_all("<Prior>",
+                           lambda e: self._canvas.yview_scroll(-1, "pages"))
+        self.root.bind_all("<Next>",
+                           lambda e: self._canvas.yview_scroll(1, "pages"))
+        self.root.bind_all("<Home>",
+                           lambda e: self._canvas.yview_moveto(0.0))
+        self.root.bind_all("<End>",
+                           lambda e: self._canvas.yview_moveto(1.0))
+
+    def _sync_control_states(self):
+        """根据各开关初始值同步滑块禁用态，并把 UI 初值推送到引擎"""
+        self.freq_shift_slider.set_enabled(self.freq_shift_var.get())
+        self.gate_threshold_slider.set_enabled(self.noise_gate_var.get())
+        self.notch_slider.set_enabled(self.notch_var.get())
+        for t in (self.follow_toggle,):
+            t.refresh()
+
+        self.engine.set_input_gain(self.input_gain_var.get() / 100.0)
+        self.engine.set_volume(self.volume_var.get() / 100.0)
+        self.engine.set_freq_shift_enabled(self.freq_shift_var.get())
+        self.engine.set_freq_shift_amount(self.freq_shift_amount_var.get())
+        self.engine.set_noise_gate_enabled(self.noise_gate_var.get())
+        self.engine.set_notch_enabled(self.notch_var.get())
+        self.engine.set_notch_attenuation_db(self.notch_attenuation_var.get())
 
     # ---------- 设备管理 ----------
 
     def _refresh_devices(self):
-        """刷新设备列表
-
-        参数 on_user_action 区分「启动时首次枚举」与「用户点刷新」：
-        启动时可以恢复上次偏好；用户主动点刷新时，应当反映系统当前状态
-        （否则用户改了系统默认设备，一刷新又被旧偏好覆盖回去，看起来像没反应）。
-        """
+        """刷新设备列表（用户点击：反映系统当前状态）"""
         return self._refresh_devices_impl(user_action=True)
 
     def _refresh_devices_impl(self, user_action: bool = True):
         try:
-            # 刷新前记住当前选择，便于刷新后对比提示
             prev_in = self.input_combo.get()
             prev_out = self.output_combo.get()
 
             # 【关键】重载 PortAudio，才能发现「程序启动后才连上」的蓝牙耳机。
-            # PortAudio 首次初始化后一直用设备表快照，不重载就永远看不到新设备。
-            # 但引擎运行中不能重载（会打断音频流），此时退化为仅重新查询。
+            # 引擎运行中不能重载（会打断音频流），退化为仅重新查询。
             reloaded = False
             if not self.engine.is_running:
                 reloaded = DeviceManager.reload_portaudio()
 
-            # 获取按优先级排序且过滤可用的设备
             all_input = DeviceManager.get_input_devices(sort_by_priority=True)
             all_output = DeviceManager.get_output_devices(sort_by_priority=True)
 
-            # 过滤出真正可用的设备（避免显示打不开的设备）
-            self._input_devices = DeviceManager.filter_usable_devices(all_input, is_input=True)
-            self._output_devices = DeviceManager.filter_usable_devices(all_output, is_input=False)
+            self._input_devices = DeviceManager.filter_usable_devices(
+                all_input, is_input=True)
+            self._output_devices = DeviceManager.filter_usable_devices(
+                all_output, is_input=False)
 
-            # 如果过滤后为空（可能测试有问题），回退到全部设备
             if not self._input_devices:
                 self._input_devices = all_input
             if not self._output_devices:
                 self._output_devices = all_output
 
-            # 更新输入下拉框（显示完整名称含 API 标签）
+            # 输入下拉框（完整名 + 类型标签）
             input_names = []
             for d in self._input_devices:
                 name = d.full_display_name
-                # 添加类型标签
                 if d.is_bluetooth:
                     name += "  🎧"
-                elif d.device_type == 'virtual':
+                elif d.device_type == "virtual":
                     name += "  💻"
                 input_names.append(name)
-            self.input_combo['values'] = input_names
+            self.input_combo["values"] = input_names
 
-            # 更新输出下拉框
+            # 输出下拉框
             output_names = []
             for d in self._output_devices:
                 name = d.full_display_name
                 if d.is_bluetooth:
                     name += "  🎧"
                 elif d.is_display_audio:
-                    # HDMI / DisplayPort 显示器音频（名字里通常没有 "hdmi"）
                     name += "  📺"
-                elif d.device_type == 'virtual':
+                elif d.device_type == "virtual":
                     name += "  💻"
                 output_names.append(name)
-            self.output_combo['values'] = output_names
+            self.output_combo["values"] = output_names
 
-            # 智能选择默认设备
             self._auto_select_devices(user_action=user_action)
 
-            # 提示本次刷新带来的变化（让用户确认刷新确实起作用了）
             if user_action:
                 new_in = self.input_combo.get()
                 new_out = self.output_combo.get()
@@ -991,7 +900,6 @@ class MainWindow:
                 if not changes:
                     changes.append("当前选择未变")
 
-                # 汇总扫描结果，特别是蓝牙设备是否已出现
                 bt_in = [d for d in self._input_devices if d.is_bluetooth]
                 bt_out = [d for d in self._output_devices if d.is_bluetooth]
                 scan_txt = (
@@ -1000,7 +908,6 @@ class MainWindow:
                     f"其中蓝牙：输入 {len(bt_in)} 个，输出 {len(bt_out)} 个"
                     + ("" if (bt_in or bt_out) else "　⚠️ 未发现蓝牙设备"))
 
-                # 汇报系统默认设备，便于用户核对
                 try:
                     sd_in = DeviceManager.find_system_default_input()
                     sd_out = DeviceManager.find_system_default_output()
@@ -1028,28 +935,22 @@ class MainWindow:
     def _auto_select_devices(self, user_action: bool = False):
         """智能选择默认设备
 
-        选择优先级：
-          0) 若用户勾选「跟随系统默认设备」→ 直接用 Windows 默认输入/输出
-          1) 输入：优先蓝牙麦克风（本工具的主用场景）
-          2) 输出：启动时优先恢复上次手动选择 → HDMI → 内置扬声器 → 第一个
-                   （用户点刷新时不恢复偏好，改为反映系统当前默认，
-                     否则改系统设置后刷新会被旧偏好盖回去）
+        优先级：
+          0) 勾选「跟随系统默认设备」→ 直接用 Windows 默认输入/输出
+          1) 输入：刷新时优先系统默认，其次蓝牙麦克风；最后非虚拟物理麦
+          2) 输出：启动恢复偏好 → 刷新跟系统默认 → HDMI → 内置扬声器
         """
         # ---- 0) 跟随系统默认 ----
-        if getattr(self, 'follow_default_var', None) and self.follow_default_var.get():
+        if getattr(self, "follow_default_var", None) and self.follow_default_var.get():
             if self._apply_system_default(fallback=True):
                 return
 
         # ---- 1) 输入设备 ----
-        # 用户点刷新时优先跟随系统默认输入；启动时优先蓝牙麦克风（本工具主场景）。
-        # 之前无脑 fallback 到 index 0，会选中排在最前的 WASAPI 虚拟声卡
-        # （CABLE Output），这不是用户想要的麦克风。
         in_candidates = []
         if user_action:
             sd_in = DeviceManager.find_system_default_input()
             if sd_in:
                 in_candidates.append(sd_in.index)
-        # 蓝牙麦克风（启动时的主选，也是刷新的次选）
         bt_input = DeviceManager.find_bluetooth_input()
         if bt_input:
             in_candidates.append(bt_input.index)
@@ -1066,9 +967,8 @@ class MainWindow:
                 break
 
         if not picked:
-            # 退而求其次：优先选「非虚拟」的物理麦克风，避免落到虚拟声卡上
             for i, d in enumerate(self._input_devices):
-                if d.device_type != 'virtual':
+                if d.device_type != "virtual":
                     self.input_combo.current(i)
                     self._on_input_selected(None)
                     picked = True
@@ -1078,7 +978,6 @@ class MainWindow:
             self._on_input_selected(None)
 
         # ---- 2) 输出设备 ----
-        # 仅在启动时（非用户刷新）恢复上次偏好
         if not user_action:
             pref = self._load_preferred_output()
             if pref:
@@ -1089,7 +988,6 @@ class MainWindow:
                         self._on_output_selected(None)
                         return
         else:
-            # 用户点刷新：优先跟随系统默认输出（改了就跟着变）
             sd_out = DeviceManager.find_system_default_output()
             if sd_out:
                 for i, d in enumerate(self._output_devices):
@@ -1098,7 +996,6 @@ class MainWindow:
                         self._on_output_selected(None)
                         return
 
-        # 优先选 HDMI / DisplayPort 显示器音频
         hdmi_out = DeviceManager.find_hdmi_output()
         if hdmi_out:
             for i, d in enumerate(self._output_devices):
@@ -1106,7 +1003,6 @@ class MainWindow:
                     self.output_combo.current(i)
                     self._on_output_selected(None)
                     return
-        # 找内置扬声器
         builtin_out = DeviceManager.find_builtin_output()
         if builtin_out:
             for i, d in enumerate(self._output_devices):
@@ -1119,85 +1015,86 @@ class MainWindow:
             self._on_output_selected(None)
 
     def _on_input_selected(self, event):
-        """输入设备选中"""
+        """输入设备选中：更新设备名 / 徽章 / 元信息行"""
         idx = self.input_combo.current()
-        if idx >= 0 and idx < len(self._input_devices):
-            device = self._input_devices[idx]
-            api_name = device.hostapi_name or f"API {device.hostapi}"
-            tag = "  ★ 系统默认" if device.is_system_default else ""
-            self.input_info.config(
-                text=(f"{device.display_name}{tag}\n"
-                      f"声道: {device.max_input_channels}  |  "
-                      f"标称采样率: {int(device.default_samplerate)} Hz  |  {api_name}")
-            )
-            if not self.engine.is_running:
-                self.engine.set_input_device(device)
-                # 显示引擎实际选定的采样率（可能与标称不同，
-                # 例如蓝牙 WASAPI 端点标称 16k、MME 端点标称 44.1k）
-                try:
-                    picked = self.engine._input_samplerate
-                except Exception:
-                    picked = int(device.default_samplerate)
-                self.input_info.config(
-                    text=(f"{device.display_name}{tag}\n"
-                          f"声道: {device.max_input_channels}  |  "
-                          f"实际使用: {picked} Hz  |  {api_name}")
-                )
+        if idx < 0 or idx >= len(self._input_devices):
+            return
+        device = self._input_devices[idx]
+        api_name = device.hostapi_name or f"API {device.hostapi}"
+
+        self.input_name_label.config(text=device.display_name)
+        if device.is_system_default:
+            self.input_default_badge.pack(side=tk.LEFT, padx=(8, 0))
+        else:
+            self.input_default_badge.pack_forget()
+
+        if not self.engine.is_running:
+            self.engine.set_input_device(device)
+            # 显示引擎实际选定的采样率（可能与标称不同）
+            try:
+                picked = self.engine._input_samplerate
+            except Exception:
+                picked = int(device.default_samplerate)
+        else:
+            picked = int(device.default_samplerate)
+
+        self.input_meta_label.config(
+            text=f"CH {device.max_input_channels} · {picked / 1000:.1f} kHz · {api_name}")
 
     def _on_output_selected(self, event):
-        """输出设备选中"""
+        """输出设备选中：更新设备名 / 徽章 / 元信息 / 绿色横幅"""
         idx = self.output_combo.current()
-        if idx >= 0 and idx < len(self._output_devices):
-            device = self._output_devices[idx]
-            api_name = device.hostapi_name or f"API {device.hostapi}"
-            tag = "  ★ 系统默认" if device.is_system_default else ""
-            self.output_info.config(
-                text=(f"{device.display_name}{tag}\n"
-                      f"声道: {device.max_output_channels}  |  "
-                      f"标称采样率: {int(device.default_samplerate)} Hz  |  {api_name}")
-            )
-            # 更新醒目提示
-            short_name = device.display_name
-            if len(short_name) > 30:
-                short_name = short_name[:28] + "..."
-            # 判定顺序很重要：蓝牙耳机也可能被识别为 display_audio/virtual，
-            # 但用户最需要知道的是「它是不是蓝牙耳机」，所以蓝牙优先。
-            if device.is_bluetooth:
-                tag = "🎧 蓝牙"
-            elif device.is_display_audio:
-                tag = "📺 HDMI/显示器"
-            elif device.device_type == 'virtual':
-                tag = "💻 虚拟声卡"
-            else:
-                tag = "🔊 扬声器"
-            self.output_target_label.config(
-                text=f"💡 声音将从：{short_name}  （{tag}）"
-                     + ("   ★系统默认" if device.is_system_default else ""))
-            # 记住用户选择，供下次启动自动恢复。
-            # 但「跟随系统默认」模式下不记，否则会把系统默认固化成手动偏好。
-            if not (getattr(self, 'follow_default_var', None)
-                    and self.follow_default_var.get()):
-                self._save_preferred_output(device)
-            if not self.engine.is_running:
-                self.engine.set_output_device(device)
+        if idx < 0 or idx >= len(self._output_devices):
+            return
+        device = self._output_devices[idx]
+        api_name = device.hostapi_name or f"API {device.hostapi}"
+
+        self.output_name_label.config(text=device.display_name)
+        if device.is_system_default:
+            self.output_default_badge.pack(side=tk.LEFT, padx=(8, 0))
+        else:
+            self.output_default_badge.pack_forget()
+
+        if not self.engine.is_running:
+            self.engine.set_output_device(device)
+            try:
+                picked = self.engine._output_samplerate
+            except Exception:
+                picked = int(device.default_samplerate)
+        else:
+            picked = int(device.default_samplerate)
+
+        self.output_meta_label.config(
+            text=f"CH {device.max_output_channels} · {picked / 1000:.1f} kHz · {api_name}")
+
+        # 绿色横幅（对齐设计稿：只放设备名，类型由下拉框里的 🎧/📺 标签表达）
+        short_name = device.display_name
+        if len(short_name) > 24:
+            short_name = short_name[:22] + "…"
+        self.output_target_label.config(
+            text=f"🔊 声音将从：{short_name} 播放")
+
+        # 记住用户选择（跟随系统默认模式下不记，避免固化系统默认）
+        if not (getattr(self, "follow_default_var", None)
+                and self.follow_default_var.get()):
+            self._save_preferred_output(device)
+        if not self.engine.is_running:
+            self.engine.set_output_device(device)
 
     # ---------- 设备偏好记忆 ----------
 
     def _pref_file(self) -> str:
         """偏好文件路径
 
-        源码运行 -> 项目根/.device_prefs.json（避免污染用户目录）
+        源码运行 -> 项目根/.device_prefs.json
         打包运行 -> %APPDATA%\\BTSPK\\.device_prefs.json
-          （exe 解包目录 _MEIPASS 是只读临时的，写进去下次启动就丢）
-        具体解析见 audio_router/services/paths.py。
         """
-        return data_file('.device_prefs.json')
+        return data_file(".device_prefs.json")
 
     def _load_prefs(self) -> dict:
-        """读取全部偏好（容错：任何异常都返回空字典）"""
         try:
             if os.path.exists(self._pref_file()):
-                with open(self._pref_file(), 'r', encoding='utf-8') as f:
+                with open(self._pref_file(), "r", encoding="utf-8") as f:
                     data = json.load(f)
                 if isinstance(data, dict):
                     return data
@@ -1206,38 +1103,33 @@ class MainWindow:
         return {}
 
     def _update_prefs(self, **kwargs):
-        """合并写入偏好项"""
         try:
             prefs = self._load_prefs()
             prefs.update(kwargs)
-            with open(self._pref_file(), 'w', encoding='utf-8') as f:
+            with open(self._pref_file(), "w", encoding="utf-8") as f:
                 json.dump(prefs, f, ensure_ascii=False, indent=2)
             self._prefs = prefs
         except Exception:
             pass  # 偏好保存失败不影响主流程
 
     def _save_preferred_output(self, device):
-        """记录用户手动选择的输出设备名，下次优先恢复"""
         self._update_prefs(output_name=device.name,
                            output_hostapi=device.hostapi_name)
 
     def _load_preferred_output(self):
-        """读取上次选择的输出设备名，返回 (name, hostapi) 或 None"""
-        name = self._prefs.get('output_name')
+        name = self._prefs.get("output_name")
         if name:
-            return name, self._prefs.get('output_hostapi', '')
+            return name, self._prefs.get("output_hostapi", "")
         return None
 
     def _on_follow_default_toggle(self):
-        """「跟随系统默认设备」开关变化"""
         follow = bool(self.follow_default_var.get())
         self._update_prefs(follow_system_default=follow)
         if follow:
-            # 立刻按系统默认重选一次，让用户马上看到效果
             self._apply_system_default(fallback=False)
 
     def _apply_system_default(self, fallback: bool = True) -> bool:
-        """按 Windows 默认设备重选输入/输出，返回是否成功选中了至少一项"""
+        """按 Windows 默认设备重选输入/输出，返回是否选中了至少一项"""
         ok = False
 
         d_in = DeviceManager.find_system_default_input()
@@ -1269,13 +1161,11 @@ class MainWindow:
     # ---------- 音量/增益控制 ----------
 
     def _on_input_gain_change(self, value):
-        """麦克风增益滑块变化"""
         gain = float(value)
         self.input_gain_label.config(text=f"{int(gain)}%")
         self.engine.set_input_gain(gain / 100.0)
 
     def _on_volume_change(self, value):
-        """音量滑块变化"""
         vol = float(value)
         self.volume_label.config(text=f"{int(vol)}%")
         self.engine.set_volume(vol / 100.0)
@@ -1283,18 +1173,14 @@ class MainWindow:
     # ---------- 防啸叫控制 ----------
 
     def _on_noise_gate_toggle(self):
-        """噪声门开关"""
         enabled = self.noise_gate_var.get()
         self.engine.set_noise_gate_enabled(enabled)
-        self.gate_threshold_slider.config(state='normal' if enabled else 'disabled')
+        self.gate_threshold_slider.set_enabled(enabled)
 
     def _on_gate_threshold_change(self, value):
-        """噪声门阈值滑块变化（UI值 0.5~10.0 对应实际阈值 0.005~0.1）"""
+        """灵敏度滑块（UI值 0.5~10.0 对应实际阈值 0.005~0.1）"""
         val = float(value)
-        # 映射到实际阈值：0.5 -> 0.005, 10.0 -> 0.1
-        threshold = val / 100.0
-        self.engine.set_noise_gate_threshold(threshold)
-        # 更新标签文字
+        self.engine.set_noise_gate_threshold(val / 100.0)
         if val < 1.0:
             label_text = "很高"
         elif val < 2.0:
@@ -1307,42 +1193,22 @@ class MainWindow:
             label_text = "很低"
         self.gate_threshold_label.config(text=label_text)
 
-    def _on_sidechain_toggle(self):
-        """侧链抑制开关"""
-        enabled = self.sidechain_var.get()
-        self.engine.set_sidechain_enabled(enabled)
-        self.sidechain_slider.config(state='normal' if enabled else 'disabled')
-
-    def _on_sidechain_amount_change(self, value):
-        """侧链抑制强度滑块变化"""
-        val = float(value)
-        self.sidechain_amount_label.config(text=f"{int(val)}%")
-        self.engine.set_sidechain_amount(val / 100.0)
-
-    # ---------- 频谱移频控制 ----------
-
     def _on_freq_shift_toggle(self):
-        """频谱移频开关"""
         enabled = self.freq_shift_var.get()
         self.engine.set_freq_shift_enabled(enabled)
-        self.freq_shift_slider.config(state='normal' if enabled else 'disabled')
+        self.freq_shift_slider.set_enabled(enabled)
 
     def _on_freq_shift_amount_change(self, value):
-        """移频量滑块变化"""
         val = float(value)
         self.freq_shift_amount_label.config(text=f"{val:.1f} Hz")
         self.engine.set_freq_shift_amount(val)
 
-    # ---------- 自适应陷波控制 ----------
-
     def _on_notch_toggle(self):
-        """自适应陷波开关"""
         enabled = self.notch_var.get()
         self.engine.set_notch_enabled(enabled)
-        self.notch_slider.config(state='normal' if enabled else 'disabled')
+        self.notch_slider.set_enabled(enabled)
 
     def _on_notch_attenuation_change(self, value):
-        """陷波衰减强度滑块变化"""
         val = float(value)
         self.notch_attenuation_label.config(text=f"{int(val)} dB")
         self.engine.set_notch_attenuation_db(val)
@@ -1350,15 +1216,13 @@ class MainWindow:
     # ---------- 路由控制 ----------
 
     def _toggle_router(self):
-        """切换路由启停"""
         if self.engine.is_running:
             self._stop_router()
         else:
             self._start_router()
 
     def _start_router(self):
-        """启动路由（必须在主线程执行，PortAudio 要求流在创建它的线程中启动）"""
-        # 验证设备选择
+        """启动路由（PortAudio 要求流在创建它的线程中启动，故在 UI 线程执行）"""
         input_idx = self.input_combo.current()
         output_idx = self.output_combo.current()
 
@@ -1369,64 +1233,68 @@ class MainWindow:
             messagebox.showwarning("提示", "请选择输出设备（扬声器）")
             return
 
-        # 更新引擎设备
         self.engine.set_input_device(self._input_devices[input_idx])
         self.engine.set_output_device(self._output_devices[output_idx])
 
-        # 禁用下拉框和刷新按钮
-        self.input_combo.config(state='disabled')
-        self.output_combo.config(state='disabled')
+        self.input_combo.config(state="disabled")
+        self.output_combo.config(state="disabled")
 
-        # 按钮变为停止
-        self.start_button.config(text="■  停止路由", bg=self.COLOR_DANGER,
+        self.start_button.config(text="■  停止路由", bg=COLOR_RED,
                                  activebackground="#f87171")
+        self._set_status_pill(running=True)
 
-        # 注意：PortAudio/WASAPI 流必须在创建它们的同一线程中启动
-        # 所以直接在 UI 线程启动（启动操作很快，不会明显卡 UI）
         import traceback
         try:
             self.engine.start()
         except Exception as e:
             error_msg = f"{type(e).__name__}: {str(e)}"
             print(f"\n[START ERROR] {error_msg}")
-            print(traceback.format_exc())
+            traceback.print_exc()
             self._on_start_error(error_msg)
 
     def _on_start_error(self, error_msg, detail=""):
-        """启动失败回调"""
-        # 显示详细错误信息
         messagebox.showerror("Start Failed", error_msg)
         self._reset_ui_to_stopped()
 
     def _stop_router(self):
-        """停止路由"""
         threading.Thread(target=self._do_stop, daemon=True).start()
 
     def _do_stop(self):
-        """实际停止（后台线程）"""
         try:
             self.engine.stop()
         finally:
             self.root.after(0, self._reset_ui_to_stopped)
 
+    def _set_status_pill(self, running: bool):
+        """右上角状态胶囊样式"""
+        if running:
+            self.status_label.config(text="● 运行中", fg=COLOR_GREEN,
+                                     bg=COLOR_GREEN_BG)
+        else:
+            self.status_label.config(text="● 未运行", fg=COLOR_TEXT_3,
+                                     bg=COLOR_PILL)
+
     def _reset_ui_to_stopped(self):
         """重置 UI 到停止状态"""
-        self.input_combo.config(state='readonly')
-        self.output_combo.config(state='readonly')
-        self.start_button.config(text="▶  开始路由", bg=self.COLOR_ACCENT,
-                                 activebackground=self.COLOR_ACCENT_HOVER)
-        self.status_label.config(text="● 未运行", fg=self.COLOR_TEXT_SECONDARY)
+        self.input_combo.config(state="readonly")
+        self.output_combo.config(state="readonly")
+        self.start_button.config(text="▶  开始路由", bg=COLOR_ACCENT,
+                                 activebackground=COLOR_ACCENT_HI)
+        self._set_status_pill(running=False)
         self._ensure_meter_state()
-        self._meter_display = {'in': 0.0, 'out': 0.0}
-        self._meter_peak = {'in': 0.0, 'out': 0.0}
-        self._meter_peak_hold = {'in': 0, 'out': 0}
+        self._meter_display = {"in": 0.0, "out": 0.0}
+        self._meter_peak = {"in": 0.0, "out": 0.0}
+        self._meter_peak_hold = {"in": 0, "out": 0}
         self._draw_meter(self.input_meter_canvas, 0.0)
         self._draw_meter(self.output_meter_canvas, 0.0)
         self.input_meter_value.config(text="-∞ dB")
         self.output_meter_value.config(text="-∞ dB")
-        self.latency_label.config(text="延迟: -- ms")
-        self.buffer_label.config(text="缓冲: --")
-        self.notch_freq_label.config(text="当前陷波：(无)", fg=self.COLOR_TEXT_SECONDARY)
+        self.latency_label.config(text="延迟 -- ms")
+        self.buffer_label.config(text="缓冲 --")
+        self.xrun_label.config(text="丢失 0", fg=COLOR_TEXT_3)
+        self.notch_freq_label.config(text="当前陷波: 无", fg=COLOR_TEXT_3)
+        self.gate_status_label.config(text="抑制门 · 关闭", fg=COLOR_TEXT_3,
+                                      bg=COLOR_PILL)
 
     # ---------- 引擎回调 ----------
 
@@ -1435,133 +1303,116 @@ class MainWindow:
         self.root.after(0, lambda: self._update_status_text(status))
 
     def _on_engine_error(self, error: str):
-        """引擎错误回调（可能在非UI线程）"""
         self.root.after(0, lambda: messagebox.showerror("错误", error))
 
     def _update_status_text(self, status: str):
-        """更新状态文字"""
-        if status == 'started':
-            self.status_label.config(text="● 运行中", fg=self.COLOR_SUCCESS)
-        elif status == 'stopped':
-            self.status_label.config(text="● 已停止", fg=self.COLOR_TEXT_SECONDARY)
+        if status == "started":
+            self._set_status_pill(running=True)
+        elif status == "stopped":
+            self._set_status_pill(running=False)
 
     # ---------- UI 刷新 ----------
 
     def _update_ui(self):
-        """定时刷新 UI 显示（电平、状态等）"""
+        """定时刷新 UI 显示（电平、状态等，约 30 FPS）"""
         if not self._ui_running:
             return
 
         if self.engine.is_running:
-            # 更新电平表
-            # 注意：raw level 是线性 RMS。正常说话时蓝牙麦克风只有 0.002~0.03，
-            # 若直接按 level 比例画条，200px 的条只会亮 0~6px —— 看起来就是「没反应」。
-            # 所以这里用 dB 映射 + 噪声地板，再做快起慢落平滑和峰值保持。
             in_level = self.engine.input_level
             out_level = self.engine.output_level
             in_ratio = self._level_to_ratio(in_level)
             out_ratio = self._level_to_ratio(out_level)
 
-            self._meter_smooth('in', in_ratio)
-            self._meter_smooth('out', out_ratio)
+            self._meter_smooth("in", in_ratio)
+            self._meter_smooth("out", out_ratio)
 
-            self._draw_meter(self.input_meter_canvas, self._meter_display['in'],
-                             peak=self._meter_peak['in'])
-            self._draw_meter(self.output_meter_canvas, self._meter_display['out'],
-                             peak=self._meter_peak['out'])
+            self._draw_meter(self.input_meter_canvas,
+                             self._meter_display["in"],
+                             peak=self._meter_peak["in"])
+            self._draw_meter(self.output_meter_canvas,
+                             self._meter_display["out"],
+                             peak=self._meter_peak["out"])
 
-            # 更新 dB 值
             in_db = self._level_to_db(in_level)
             out_db = self._level_to_db(out_level)
             self.input_meter_value.config(text=f"{in_db} dB")
             self.output_meter_value.config(text=f"{out_db} dB")
 
-            # 更新延迟和缓冲
             latency = self.engine.estimated_latency_ms
-            self.latency_label.config(text=f"延迟: {latency:.0f} ms")
+            self.latency_label.config(text=f"延迟 {latency:.0f} ms")
 
             buf_pct = self.engine.buffer_occupancy * 100
-            self.buffer_label.config(text=f"缓冲: {buf_pct:.0f}%")
+            self.buffer_label.config(text=f"缓冲 {buf_pct:.0f}%")
 
-            # 更新欠载计数
             xruns = self.engine.xruns
-            xrun_text = f"欠载: {xruns}"
-            xrun_color = self.COLOR_WARNING if xruns > 0 else self.COLOR_TEXT_SECONDARY
-            self.xrun_label.config(text=xrun_text, fg=xrun_color)
+            xrun_color = COLOR_ORANGE if xruns > 0 else COLOR_TEXT_3
+            self.xrun_label.config(text=f"丢失 {xruns}", fg=xrun_color)
 
-            # 更新噪声门状态
+            # 抑制门状态胶囊
             gate_gain = self.engine.gate_gain
             if self.noise_gate_var.get():
                 if gate_gain > 0.8:
-                    self.gate_status_label.config(text="  🟢 门打开", fg='#22c55e')
+                    self.gate_status_label.config(text="抑制门 · 打开",
+                                                  fg=COLOR_GREEN,
+                                                  bg=COLOR_GREEN_BG)
                 elif gate_gain > 0.2:
-                    self.gate_status_label.config(text="  🟡 过渡中", fg='#f59e0b')
+                    self.gate_status_label.config(text="抑制门 · 过渡",
+                                                  fg=COLOR_ORANGE,
+                                                  bg=COLOR_PILL)
                 else:
-                    self.gate_status_label.config(text="  🔇 门关闭", fg='#6b7280')
+                    self.gate_status_label.config(text="抑制门 · 关闭",
+                                                  fg=COLOR_TEXT_3,
+                                                  bg=COLOR_PILL)
             else:
-                self.gate_status_label.config(text="  ⏸️ 已停用", fg='#6b7280')
+                self.gate_status_label.config(text="抑制门 · 关闭",
+                                              fg=COLOR_TEXT_3, bg=COLOR_PILL)
 
-            # 更新陷波频率显示
-            # 这是判断「算法有没有误伤自己声音」的最直接依据：
-            # 正常说话时这里应该始终显示「(无)」；只有真啸叫时才会出现频率。
+            # 当前陷波频率
             self._update_notch_freq_display()
 
-        # 30ms 后再次刷新（约 30 FPS）
         self.root.after(30, self._update_ui)
 
     def _update_notch_freq_display(self):
-        """刷新当前激活的陷波频率"""
+        """刷新当前激活的陷波频率（说话时应始终为「无」）"""
         try:
             freqs = self.engine.get_active_notch_freqs()
         except Exception:
             freqs = []
 
         if not self.notch_var.get():
-            self.notch_freq_label.config(text="当前陷波：(陷波已停用)", fg=self.COLOR_TEXT_SECONDARY)
+            self.notch_freq_label.config(text="当前陷波: (陷波已停用)",
+                                         fg=COLOR_TEXT_3)
             return
 
         if not freqs:
-            self.notch_freq_label.config(text="当前陷波：(无)  ✓ 未检测到啸叫",
-                                         fg=self.COLOR_SUCCESS)
+            self.notch_freq_label.config(text="当前陷波: 无  ✓ 未检测到啸叫",
+                                         fg=COLOR_TEXT_3)
             return
 
         text = "  ".join(f"{f:.0f}Hz" for f in freqs)
         self.notch_freq_label.config(
-            text=f"当前陷波 ({len(freqs)} 个)：{text}",
-            fg=self.COLOR_WARNING)
+            text=f"当前陷波 ({len(freqs)} 个): {text}", fg=COLOR_ORANGE)
 
     # ---------- 电平表：dB 映射 / 弹道 / 峰值保持 ----------
 
-    # 噪声地板与满刻度：低于 -70dBFS 视为无声，0dBFS 为满格。
-    # 地板取 -70 而非 -60：蓝牙 HFP 麦克风电平天然偏低（正常说话常在
-    # -45 ~ -65 dBFS），若地板是 -60，说话时电平条仍会基本不动。
-    METER_FLOOR_DB = -70.0
-    METER_CEIL_DB = 0.0
-    # 快起慢落：上升立即跟随（防漏掉字首），下降按每帧比例衰减
-    METER_ATTACK = 1.0
-    METER_RELEASE = 0.25
-    # 峰值保持衰减（每帧）
-    METER_PEAK_DECAY = 0.012
-
     def _ensure_meter_state(self):
-        """惰性初始化电平表状态（在 __init__ 之外做，避免改动构造函数）"""
-        if not hasattr(self, '_meter_display'):
-            self._meter_display = {'in': 0.0, 'out': 0.0}
-            self._meter_peak = {'in': 0.0, 'out': 0.0}
-            self._meter_peak_hold = {'in': 0, 'out': 0}
+        if not hasattr(self, "_meter_display"):
+            self._meter_display = {"in": 0.0, "out": 0.0}
+            self._meter_peak = {"in": 0.0, "out": 0.0}
+            self._meter_peak_hold = {"in": 0, "out": 0}
 
     def _level_to_ratio(self, level: float) -> float:
         """线性 RMS → 0.0~1.0 的显示比例（dB 映射）"""
         if level <= 1e-7:
             return 0.0
-        import math
         db = 20.0 * math.log10(level)
         span = self.METER_CEIL_DB - self.METER_FLOOR_DB
         ratio = (db - self.METER_FLOOR_DB) / span
         return max(0.0, min(1.0, ratio))
 
     def _meter_smooth(self, key: str, target: float):
-        """对电平做快起慢落平滑，并维护峰值保持"""
+        """快起慢落平滑 + 峰值保持"""
         self._ensure_meter_state()
         cur = self._meter_display[key]
 
@@ -1573,7 +1424,6 @@ class MainWindow:
                 cur = 0.0
         self._meter_display[key] = cur
 
-        # 峰值保持：更新则重置保持计时，之后缓慢下落
         if cur >= self._meter_peak[key]:
             self._meter_peak[key] = cur
             self._meter_peak_hold[key] = 12  # 约 0.36s
@@ -1581,53 +1431,67 @@ class MainWindow:
             if self._meter_peak_hold[key] > 0:
                 self._meter_peak_hold[key] -= 1
             else:
-                self._meter_peak[key] = max(cur, self._meter_peak[key] - self.METER_PEAK_DECAY)
+                self._meter_peak[key] = max(
+                    cur, self._meter_peak[key] - self.METER_PEAK_DECAY)
+
+    @staticmethod
+    def _meter_color(t: float) -> str:
+        """电平条渐变色：绿(低) → 黄 → 红(高)"""
+        if t < 0.6:
+            return _lerp_color(COLOR_METER_GREEN, COLOR_METER_YELLOW, t / 0.6)
+        return _lerp_color(COLOR_METER_YELLOW, COLOR_RED, (t - 0.6) / 0.4)
 
     def _draw_meter(self, canvas: tk.Canvas, ratio: float, peak: float = 0.0):
-        """绘制电平表（ratio 已是 0~1 的显示比例）"""
+        """绘制圆角电平条：暗色轨道 + 绿→黄→红渐变填充 + 峰值白线"""
         canvas.update_idletasks()
         width = canvas.winfo_width()
         height = canvas.winfo_height()
-
         if width <= 1:
             return
 
         canvas.delete("all")
+        mid = height / 2
+        pad = 2
+        span = width - 2 * pad
 
-        # 背景
-        canvas.create_rectangle(0, 0, width, height, fill=self.COLOR_METER_BG, outline="")
+        # 轨道（圆角胶囊）
+        canvas.create_line(pad, mid, width - pad, mid, width=height - 2,
+                           capstyle="round", fill=COLOR_TRACK)
 
-        # 电平填充（按 dB 映射，低电平也能看见明显长度）
-        fill_width = int(min(max(ratio, 0.0), 1.0) * width)
-        if fill_width > 0:
-            # 渐变色：绿 -> 黄 -> 红（阈值对齐 dB 刻度，约 -12dB / -3dB）
-            if ratio < 0.8:
-                fill_color = self.COLOR_METER_PEAK
-            elif ratio < 0.95:
-                fill_color = self.COLOR_WARNING
-            else:
-                fill_color = self.COLOR_DANGER
-            canvas.create_rectangle(0, 0, fill_width, height, fill=fill_color, outline="")
+        # 渐变填充（分段画线，绿色→黄色→红色）
+        ratio = min(max(ratio, 0.0), 1.0)
+        fill_w = ratio * span
+        if fill_w > 1:
+            segments = 28
+            seg_w = fill_w / segments
+            for i in range(segments):
+                t = (i + 0.5) / segments
+                x0 = pad + i * seg_w
+                x1 = pad + (i + 1) * seg_w
+                canvas.create_line(x0, mid, max(x1, x0 + 0.5), mid,
+                                   width=height - 2, capstyle="butt",
+                                   fill=self._meter_color(t))
+            # 末端补一段圆头，收口圆润
+            canvas.create_line(pad + fill_w, mid, pad + fill_w, mid,
+                               width=height - 2, capstyle="round",
+                               fill=self._meter_color(ratio))
 
         # 峰值保持刻线
         if peak > 0.01:
-            px = int(min(peak, 1.0) * (width - 2))
-            px = max(1, min(width - 2, px))
-            canvas.create_rectangle(px, 0, px + 2, height,
-                                    fill=self.COLOR_TEXT, outline="")
+            px = pad + min(peak, 1.0) * span
+            px = max(pad, min(width - pad, px))
+            canvas.create_line(px, mid, px, mid, width=2,
+                               fill="#dfe6ee")
 
     def _level_to_db(self, level: float) -> str:
-        """电平转 dB 显示"""
         if level < 0.0001:
             return "-∞"
-        import math
         db = 20 * math.log10(level)
         return f"{db:+.1f}"
 
     # ---------- 窗口事件 ----------
 
     def _on_close(self):
-        """窗口关闭"""
         self._ui_running = False
         try:
             self.engine.stop()
@@ -1636,5 +1500,4 @@ class MainWindow:
         self.root.destroy()
 
     def run(self):
-        """运行主循环"""
         self.root.mainloop()

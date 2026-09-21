@@ -85,8 +85,8 @@ class MainWindow:
         # 构建界面
         self._build_ui()
 
-        # 初始化设备列表
-        self._refresh_devices()
+        # 初始化设备列表（启动时允许恢复上次偏好，不弹提示框）
+        self._refresh_devices_impl(user_action=False)
 
         # 启动 UI 刷新定时器
         self._update_ui()
@@ -323,17 +323,17 @@ class MainWindow:
         # ---- 输出设备区 ----
         self._build_output_section(main)
 
-        # ---- 音量控制区 ----
-        self._build_volume_section(main)
-
-        # ---- 防啸叫控制区 ----
-        self._build_antifeedback_section(main)
-
-        # ---- 电平表区 ----
+        # ---- 电平表区（紧跟设备区，方便边说话边看电平）----
         self._build_meter_section(main)
 
         # ---- 状态信息区 ----
         self._build_status_section(main)
+
+        # ---- 防啸叫控制区 ----
+        self._build_antifeedback_section(main)
+
+        # ---- 音量控制区（麦克风增益 / 扬声器音量）置底 ----
+        self._build_volume_section(main)
 
         # ---- 固定底部提示（必须在滚动区之后 pack）----
         self._build_footer_hint()
@@ -914,8 +914,20 @@ class MainWindow:
     # ---------- 设备管理 ----------
 
     def _refresh_devices(self):
-        """刷新设备列表"""
+        """刷新设备列表
+
+        参数 on_user_action 区分「启动时首次枚举」与「用户点刷新」：
+        启动时可以恢复上次偏好；用户主动点刷新时，应当反映系统当前状态
+        （否则用户改了系统默认设备，一刷新又被旧偏好覆盖回去，看起来像没反应）。
+        """
+        return self._refresh_devices_impl(user_action=True)
+
+    def _refresh_devices_impl(self, user_action: bool = True):
         try:
+            # 刷新前记住当前选择，便于刷新后对比提示
+            prev_in = self.input_combo.get()
+            prev_out = self.output_combo.get()
+
             # 获取按优先级排序且过滤可用的设备
             all_input = DeviceManager.get_input_devices(sort_by_priority=True)
             all_output = DeviceManager.get_output_devices(sort_by_priority=True)
@@ -957,45 +969,110 @@ class MainWindow:
             self.output_combo['values'] = output_names
 
             # 智能选择默认设备
-            self._auto_select_devices()
+            self._auto_select_devices(user_action=user_action)
+
+            # 提示本次刷新带来的变化（让用户确认刷新确实起作用了）
+            if user_action:
+                new_in = self.input_combo.get()
+                new_out = self.output_combo.get()
+                changes = []
+                if new_in != prev_in:
+                    changes.append(f"输入 → {new_in}")
+                if new_out != prev_out:
+                    changes.append(f"输出 → {new_out}")
+                if not changes:
+                    changes.append("设备列表已更新，当前选择未变")
+
+                # 顺带汇报系统默认设备，便于用户核对
+                try:
+                    sd_in = DeviceManager.find_system_default_input()
+                    sd_out = DeviceManager.find_system_default_output()
+                    default_txt = (
+                        f"\n\nWindows 当前默认：\n"
+                        f"  输入：{sd_in.display_name if sd_in else '未知'}\n"
+                        f"  输出：{sd_out.display_name if sd_out else '未知'}")
+                except Exception:
+                    default_txt = ""
+
+                messagebox.showinfo(
+                    "刷新完成",
+                    "已重新扫描系统音频设备。\n\n" + "\n".join(changes) + default_txt)
 
         except Exception as e:
             messagebox.showerror("Error", f"Failed to refresh devices: {str(e)}")
 
-    def _auto_select_devices(self):
+    def _auto_select_devices(self, user_action: bool = False):
         """智能选择默认设备
 
         选择优先级：
           0) 若用户勾选「跟随系统默认设备」→ 直接用 Windows 默认输入/输出
           1) 输入：优先蓝牙麦克风（本工具的主用场景）
-          2) 输出：优先恢复上次手动选择 → HDMI → 内置扬声器 → 第一个
+          2) 输出：启动时优先恢复上次手动选择 → HDMI → 内置扬声器 → 第一个
+                   （用户点刷新时不恢复偏好，改为反映系统当前默认，
+                     否则改系统设置后刷新会被旧偏好盖回去）
         """
         # ---- 0) 跟随系统默认 ----
         if getattr(self, 'follow_default_var', None) and self.follow_default_var.get():
             if self._apply_system_default(fallback=True):
                 return
 
-        # ---- 1) 输入设备：优先选蓝牙麦克风（已通过可用性测试）----
+        # ---- 1) 输入设备 ----
+        # 用户点刷新时优先跟随系统默认输入；启动时优先蓝牙麦克风（本工具主场景）。
+        # 之前无脑 fallback 到 index 0，会选中排在最前的 WASAPI 虚拟声卡
+        # （CABLE Output），这不是用户想要的麦克风。
+        in_candidates = []
+        if user_action:
+            sd_in = DeviceManager.find_system_default_input()
+            if sd_in:
+                in_candidates.append(sd_in.index)
+        # 蓝牙麦克风（启动时的主选，也是刷新的次选）
         bt_input = DeviceManager.find_bluetooth_input()
         if bt_input:
+            in_candidates.append(bt_input.index)
+
+        picked = False
+        for want in in_candidates:
             for i, d in enumerate(self._input_devices):
-                if d.index == bt_input.index:
+                if d.index == want:
                     self.input_combo.current(i)
                     self._on_input_selected(None)
+                    picked = True
                     break
-        elif self._input_devices:
+            if picked:
+                break
+
+        if not picked:
+            # 退而求其次：优先选「非虚拟」的物理麦克风，避免落到虚拟声卡上
+            for i, d in enumerate(self._input_devices):
+                if d.device_type != 'virtual':
+                    self.input_combo.current(i)
+                    self._on_input_selected(None)
+                    picked = True
+                    break
+        if not picked and self._input_devices:
             self.input_combo.current(0)
             self._on_input_selected(None)
 
-        # ---- 输出设备：优先恢复上次选择，其次 HDMI，最后内置扬声器 ----
-        pref = self._load_preferred_output()
-        if pref:
-            pref_name, pref_api = pref
-            for i, d in enumerate(self._output_devices):
-                if d.name == pref_name and (not pref_api or d.hostapi_name == pref_api):
-                    self.output_combo.current(i)
-                    self._on_output_selected(None)
-                    return
+        # ---- 2) 输出设备 ----
+        # 仅在启动时（非用户刷新）恢复上次偏好
+        if not user_action:
+            pref = self._load_preferred_output()
+            if pref:
+                pref_name, pref_api = pref
+                for i, d in enumerate(self._output_devices):
+                    if d.name == pref_name and (not pref_api or d.hostapi_name == pref_api):
+                        self.output_combo.current(i)
+                        self._on_output_selected(None)
+                        return
+        else:
+            # 用户点刷新：优先跟随系统默认输出（改了就跟着变）
+            sd_out = DeviceManager.find_system_default_output()
+            if sd_out:
+                for i, d in enumerate(self._output_devices):
+                    if d.index == sd_out.index:
+                        self.output_combo.current(i)
+                        self._on_output_selected(None)
+                        return
 
         # 优先选 HDMI / DisplayPort 显示器音频
         hdmi_out = DeviceManager.find_hdmi_output()

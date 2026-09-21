@@ -55,6 +55,12 @@ ui_after.png
 # hosts 等系统文件的本地备份（仅调试网络用，绝不入库）
 _hosts_backup/
 
+# ===== 打包产物 =====
+# build/ 与 dist/ 已在上方 Python 段忽略
+# PyInstaller 自动生成的 spec（我们维护的是 build_exe.spec，这个是默认名）
+*.spec.bak
+BTSPK.spec
+
 # ===== 系统 =====
 .DS_Store
 Thumbs.db

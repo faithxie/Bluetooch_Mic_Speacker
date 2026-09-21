@@ -13,6 +13,7 @@ from typing import List, Optional
 from ..models.audio_device import AudioDeviceInfo
 from ..services.device_manager import DeviceManager
 from ..services.audio_router import AudioRouterEngine
+from ..services.paths import data_file, asset_path, is_frozen
 
 
 class MainWindow:
@@ -1183,14 +1184,14 @@ class MainWindow:
     # ---------- 设备偏好记忆 ----------
 
     def _pref_file(self) -> str:
-        """偏好文件路径（项目根目录，避免污染用户目录）
+        """偏好文件路径
 
-        注意层级：__file__ = <root>/audio_router/ui/main_window.py
-          dirname ×1 -> ui/   ×2 -> audio_router/   ×3 -> 项目根
-        旧实现只上溯两级，把偏好文件错放进了 audio_router/ 包目录里。
+        源码运行 -> 项目根/.device_prefs.json（避免污染用户目录）
+        打包运行 -> %APPDATA%\\BTSPK\\.device_prefs.json
+          （exe 解包目录 _MEIPASS 是只读临时的，写进去下次启动就丢）
+        具体解析见 audio_router/services/paths.py。
         """
-        base = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-        return os.path.join(base, '.device_prefs.json')
+        return data_file('.device_prefs.json')
 
     def _load_prefs(self) -> dict:
         """读取全部偏好（容错：任何异常都返回空字典）"""

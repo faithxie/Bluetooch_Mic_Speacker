@@ -95,6 +95,26 @@ venv\Scripts\python.exe -m pip install -r requirements.txt
 venv\Scripts\python.exe main.py
 ```
 
+### 打包为 EXE（免安装分发）
+
+不想在目标电脑上装 Python？双击 `build_exe.bat` 一键打包，或手动执行：
+
+```bash
+venv\Scripts\python.exe -m PyInstaller --noconfirm --clean build_exe.spec
+```
+
+产物为 **`dist\BTSPK.exe`**（单文件，约 53 MB），复制到任意 Windows 10/11 电脑双击即可运行。
+
+打包细节：
+
+| 事项 | 说明 |
+|---|---|
+| 打包配置 | `build_exe.spec`（onefile + windowed，不弹黑框） |
+| PortAudio DLL | 经本地 `hooks/hook-sounddevice.py` 只收 win64 变体，剔除 mac/arm/32bit 冗余 |
+| 设备偏好 | 打包后写入 `%APPDATA%\BTSPK\.device_prefs.json`（源码运行仍写项目根目录） |
+| 运行日志 | `%APPDATA%\BTSPK\BTSPK.log`，启动失败时会有弹窗提示 |
+| 启动速度 | onefile 首次启动需解包，约 1~3 秒；如需更快把 spec 里 `ONE_FILE = False` 改为目录版 |
+
 ### 使用步骤
 
 1. **输入设备**：选你的蓝牙耳机麦克风（带 🎧 标记，程序会自动优先选中）

@@ -43,6 +43,9 @@ class MainWindow:
         self._input_devices: List[AudioDeviceInfo] = []
         self._output_devices: List[AudioDeviceInfo] = []
 
+        # 偏好（必须早于 _build_ui，因为控件初始值要读它）
+        self._prefs: dict = self._load_prefs()
+
         # UI 刷新标志
         self._ui_running = True
 
@@ -459,10 +462,12 @@ class MainWindow:
 
     def _build_input_section(self, parent):
         """输入设备选择区"""
+        # 注意：绝不能对设备面板调用 pack_propagate(False)。
+        # 该调用会把面板尺寸冻结在「创建瞬间」的大小（空面板=1px），
+        # 之后加进来的下拉框永远撑不开它 —— 设备选择区会直接消失。
         panel = tk.Frame(parent, bg=self.COLOR_PANEL,
                          highlightthickness=1, highlightbackground=self.COLOR_BORDER)
         panel.pack(fill=tk.X, pady=(0, 6))
-        panel.pack_propagate(False)
 
         # 内边距
         inner = tk.Frame(panel, bg=self.COLOR_PANEL, padx=16, pady=8)
@@ -495,10 +500,10 @@ class MainWindow:
 
     def _build_output_section(self, parent):
         """输出设备选择区"""
+        # 同输入区：不用 pack_propagate(False)，避免面板被冻结成 1px
         panel = tk.Frame(parent, bg=self.COLOR_PANEL,
                          highlightthickness=1, highlightbackground=self.COLOR_BORDER)
         panel.pack(fill=tk.X, pady=(0, 6))
-        panel.pack_propagate(False)
 
         inner = tk.Frame(panel, bg=self.COLOR_PANEL, padx=16, pady=8)
         inner.pack(fill=tk.X)
@@ -889,6 +894,23 @@ class MainWindow:
         )
         self.start_button.pack(fill=tk.X)
 
+        # 跟随系统默认设备开关。
+        # 之前程序完全无视 Windows 的默认设备设置：输入硬性优先蓝牙麦克风、
+        # 输出优先 HDMI / 内置扬声器，并且会记住上次手动选择。
+        # 用户改了系统默认却不起作用，就是因为这三条规则在挡。
+        # 勾选此项后，程序会改为跟随 Windows 的默认输入/输出设备。
+        follow_row = tk.Frame(parent, bg=self.COLOR_BG)
+        follow_row.pack(fill=tk.X, pady=(6, 0))
+        self.follow_default_var = tk.BooleanVar(value=bool(self._prefs.get('follow_system_default', False)))
+        tk.Checkbutton(
+            follow_row, text="跟随系统默认设备（Windows 声音设置里改了就跟着变）",
+            variable=self.follow_default_var, command=self._on_follow_default_toggle,
+            bg=self.COLOR_BG, fg=self.COLOR_TEXT_SECONDARY,
+            selectcolor=self.COLOR_PANEL,
+            activebackground=self.COLOR_BG, activeforeground=self.COLOR_TEXT,
+            font=('Segoe UI', 9), bd=0, highlightthickness=0, cursor='hand2'
+        ).pack(anchor=tk.W)
+
     # ---------- 设备管理 ----------
 
     def _refresh_devices(self):
@@ -941,8 +963,19 @@ class MainWindow:
             messagebox.showerror("Error", f"Failed to refresh devices: {str(e)}")
 
     def _auto_select_devices(self):
-        """智能选择默认设备"""
-        # 输入设备：优先选蓝牙麦克风（已通过可用性测试）
+        """智能选择默认设备
+
+        选择优先级：
+          0) 若用户勾选「跟随系统默认设备」→ 直接用 Windows 默认输入/输出
+          1) 输入：优先蓝牙麦克风（本工具的主用场景）
+          2) 输出：优先恢复上次手动选择 → HDMI → 内置扬声器 → 第一个
+        """
+        # ---- 0) 跟随系统默认 ----
+        if getattr(self, 'follow_default_var', None) and self.follow_default_var.get():
+            if self._apply_system_default(fallback=True):
+                return
+
+        # ---- 1) 输入设备：优先选蓝牙麦克风（已通过可用性测试）----
         bt_input = DeviceManager.find_bluetooth_input()
         if bt_input:
             for i, d in enumerate(self._input_devices):
@@ -990,11 +1023,25 @@ class MainWindow:
         if idx >= 0 and idx < len(self._input_devices):
             device = self._input_devices[idx]
             api_name = device.hostapi_name or f"API {device.hostapi}"
+            tag = "  ★ 系统默认" if device.is_system_default else ""
             self.input_info.config(
-                text=f"声道: {device.max_input_channels}  |  采样率: {int(device.default_samplerate)} Hz  |  {api_name}"
+                text=(f"{device.display_name}{tag}\n"
+                      f"声道: {device.max_input_channels}  |  "
+                      f"标称采样率: {int(device.default_samplerate)} Hz  |  {api_name}")
             )
             if not self.engine.is_running:
                 self.engine.set_input_device(device)
+                # 显示引擎实际选定的采样率（可能与标称不同，
+                # 例如蓝牙 WASAPI 端点标称 16k、MME 端点标称 44.1k）
+                try:
+                    picked = self.engine._input_samplerate
+                except Exception:
+                    picked = int(device.default_samplerate)
+                self.input_info.config(
+                    text=(f"{device.display_name}{tag}\n"
+                          f"声道: {device.max_input_channels}  |  "
+                          f"实际使用: {picked} Hz  |  {api_name}")
+                )
 
     def _on_output_selected(self, event):
         """输出设备选中"""
@@ -1002,59 +1049,121 @@ class MainWindow:
         if idx >= 0 and idx < len(self._output_devices):
             device = self._output_devices[idx]
             api_name = device.hostapi_name or f"API {device.hostapi}"
+            tag = "  ★ 系统默认" if device.is_system_default else ""
             self.output_info.config(
-                text=f"声道: {device.max_output_channels}  |  采样率: {int(device.default_samplerate)} Hz  |  {api_name}"
+                text=(f"{device.display_name}{tag}\n"
+                      f"声道: {device.max_output_channels}  |  "
+                      f"标称采样率: {int(device.default_samplerate)} Hz  |  {api_name}")
             )
             # 更新醒目提示
             short_name = device.display_name
             if len(short_name) > 30:
                 short_name = short_name[:28] + "..."
-            if device.is_display_audio:
-                tag = "📺 HDMI/显示器"
-            elif device.is_bluetooth:
+            # 判定顺序很重要：蓝牙耳机也可能被识别为 display_audio/virtual，
+            # 但用户最需要知道的是「它是不是蓝牙耳机」，所以蓝牙优先。
+            if device.is_bluetooth:
                 tag = "🎧 蓝牙"
+            elif device.is_display_audio:
+                tag = "📺 HDMI/显示器"
             elif device.device_type == 'virtual':
                 tag = "💻 虚拟声卡"
             else:
                 tag = "🔊 扬声器"
-            self.output_target_label.config(text=f"💡 声音将从：{short_name}  （{tag}）")
-            # 记住用户选择，供下次启动自动恢复
-            self._save_preferred_output(device)
+            self.output_target_label.config(
+                text=f"💡 声音将从：{short_name}  （{tag}）"
+                     + ("   ★系统默认" if device.is_system_default else ""))
+            # 记住用户选择，供下次启动自动恢复。
+            # 但「跟随系统默认」模式下不记，否则会把系统默认固化成手动偏好。
+            if not (getattr(self, 'follow_default_var', None)
+                    and self.follow_default_var.get()):
+                self._save_preferred_output(device)
             if not self.engine.is_running:
                 self.engine.set_output_device(device)
 
-    # ---------- 输出设备偏好记忆 ----------
+    # ---------- 设备偏好记忆 ----------
 
     def _pref_file(self) -> str:
-        """偏好文件路径（与包同级，避免污染用户目录）"""
-        base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        """偏好文件路径（项目根目录，避免污染用户目录）
+
+        注意层级：__file__ = <root>/audio_router/ui/main_window.py
+          dirname ×1 -> ui/   ×2 -> audio_router/   ×3 -> 项目根
+        旧实现只上溯两级，把偏好文件错放进了 audio_router/ 包目录里。
+        """
+        base = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
         return os.path.join(base, '.device_prefs.json')
 
-    def _save_preferred_output(self, device):
-        """记录用户手动选择的输出设备名，下次优先恢复"""
+    def _load_prefs(self) -> dict:
+        """读取全部偏好（容错：任何异常都返回空字典）"""
         try:
-            prefs = {}
             if os.path.exists(self._pref_file()):
                 with open(self._pref_file(), 'r', encoding='utf-8') as f:
-                    prefs = json.load(f)
-            prefs['output_name'] = device.name
-            prefs['output_hostapi'] = device.hostapi_name
+                    data = json.load(f)
+                if isinstance(data, dict):
+                    return data
+        except Exception:
+            pass
+        return {}
+
+    def _update_prefs(self, **kwargs):
+        """合并写入偏好项"""
+        try:
+            prefs = self._load_prefs()
+            prefs.update(kwargs)
             with open(self._pref_file(), 'w', encoding='utf-8') as f:
                 json.dump(prefs, f, ensure_ascii=False, indent=2)
+            self._prefs = prefs
         except Exception:
             pass  # 偏好保存失败不影响主流程
 
+    def _save_preferred_output(self, device):
+        """记录用户手动选择的输出设备名，下次优先恢复"""
+        self._update_prefs(output_name=device.name,
+                           output_hostapi=device.hostapi_name)
+
     def _load_preferred_output(self):
         """读取上次选择的输出设备名，返回 (name, hostapi) 或 None"""
-        try:
-            if os.path.exists(self._pref_file()):
-                with open(self._pref_file(), 'r', encoding='utf-8') as f:
-                    prefs = json.load(f)
-                if prefs.get('output_name'):
-                    return prefs['output_name'], prefs.get('output_hostapi', '')
-        except Exception:
-            pass
+        name = self._prefs.get('output_name')
+        if name:
+            return name, self._prefs.get('output_hostapi', '')
         return None
+
+    def _on_follow_default_toggle(self):
+        """「跟随系统默认设备」开关变化"""
+        follow = bool(self.follow_default_var.get())
+        self._update_prefs(follow_system_default=follow)
+        if follow:
+            # 立刻按系统默认重选一次，让用户马上看到效果
+            self._apply_system_default(fallback=False)
+
+    def _apply_system_default(self, fallback: bool = True) -> bool:
+        """按 Windows 默认设备重选输入/输出，返回是否成功选中了至少一项"""
+        ok = False
+
+        d_in = DeviceManager.find_system_default_input()
+        if d_in:
+            for i, d in enumerate(self._input_devices):
+                if d.index == d_in.index:
+                    self.input_combo.current(i)
+                    self._on_input_selected(None)
+                    ok = True
+                    break
+        elif fallback and self._input_devices:
+            self.input_combo.current(0)
+            self._on_input_selected(None)
+
+        d_out = DeviceManager.find_system_default_output()
+        if d_out:
+            for i, d in enumerate(self._output_devices):
+                if d.index == d_out.index:
+                    self.output_combo.current(i)
+                    self._on_output_selected(None)
+                    ok = True
+                    break
+        elif fallback and self._output_devices:
+            self.output_combo.current(0)
+            self._on_output_selected(None)
+
+        return ok
 
     # ---------- 音量/增益控制 ----------
 

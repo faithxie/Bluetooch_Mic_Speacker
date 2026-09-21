@@ -36,7 +36,7 @@ ENV/
 
 # ===== 运行期生成 =====
 # 设备偏好（本机路径相关，不应入库）
-audio_router/.device_prefs.json
+.device_prefs.json
 # 日志与临时文件
 *.log
 *.tmp

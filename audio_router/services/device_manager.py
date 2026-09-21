@@ -46,19 +46,48 @@ class DeviceManager:
         except Exception:
             pass
 
+        # 系统默认设备（PortAudio 视角）。注意：PortAudio 只给出一个设备索引，
+        # 但该索引指向 MME 端点；同一个物理设备在 WASAPI/MME/DirectSound 下
+        # 是不同索引。因此这里同时记录「默认索引」和「默认设备名」，
+        # 后者用于跨 API 匹配同一台物理设备。
+        default_in_idx, default_out_idx = -1, -1
+        try:
+            di, do = sd.default.device
+            default_in_idx = di if di is not None else -1
+            default_out_idx = do if do is not None else -1
+        except Exception:
+            pass
+
         result = []
         for i, d in enumerate(devices):
-            hostapi_idx = d['hostapi']
             info = AudioDeviceInfo(
                 index=i,
                 name=d['name'],
                 max_input_channels=d['max_input_channels'],
                 max_output_channels=d['max_output_channels'],
                 default_samplerate=d['default_samplerate'],
-                hostapi=hostapi_idx,
-                hostapi_name=hostapi_names.get(hostapi_idx, '')
+                hostapi=d['hostapi'],
+                hostapi_name=hostapi_names.get(d['hostapi'], '')
             )
             result.append(info)
+
+        # 按名称把「系统默认」标记扩展到同一物理设备的所有 API 端点，
+        # 这样 UI 上无论是 WASAPI 还是 MME 变体都能看出它是系统默认。
+        def _norm(n: str) -> str:
+            return AudioDeviceInfo(
+                index=0, name=n, max_input_channels=0, max_output_channels=0,
+                default_samplerate=0, hostapi=0).display_name.lower()
+
+        default_in_name = _norm(result[default_in_idx].name) if 0 <= default_in_idx < len(result) else ''
+        default_out_name = _norm(result[default_out_idx].name) if 0 <= default_out_idx < len(result) else ''
+
+        for info in result:
+            n = _norm(info.name)
+            if info.is_input and default_in_name and n == default_in_name:
+                info.is_system_default = True
+            elif info.is_output and default_out_name and n == default_out_name:
+                info.is_system_default = True
+
         return result
 
     @staticmethod
@@ -117,6 +146,43 @@ class DeviceManager:
         except Exception:
             pass
         return None
+
+    @staticmethod
+    def find_system_default_input() -> Optional[AudioDeviceInfo]:
+        """查找系统默认输入设备中「实际可用」的那个端点。
+
+        Windows 的默认设备是「物理设备」级别的，而同一个物理设备在
+        MME / DirectSound / WASAPI 下是不同的索引。PortAudio 的
+        sd.default.device 通常指向 MME 端点，但 MME 端点有时打不开，
+        所以这里在「同一物理设备的所有输入端点」里挑一个能真正开流的，
+        优先级仍按 host API 排序（WASAPI 优先）。
+        """
+        try:
+            devices = DeviceManager.get_input_devices(sort_by_priority=True)
+        except Exception:
+            return None
+
+        cands = [d for d in devices if d.is_system_default]
+        for d in cands:
+            if DeviceManager._test_input_device(d.index, d.default_samplerate,
+                                                min(d.max_input_channels, 2)):
+                return d
+        return cands[0] if cands else None
+
+    @staticmethod
+    def find_system_default_output() -> Optional[AudioDeviceInfo]:
+        """查找系统默认输出设备中「实际可用」的那个端点（同 find_system_default_input）"""
+        try:
+            devices = DeviceManager.get_output_devices(sort_by_priority=True)
+        except Exception:
+            return None
+
+        cands = [d for d in devices if d.is_system_default]
+        for d in cands:
+            if DeviceManager._test_output_device(d.index, d.default_samplerate,
+                                                 min(d.max_output_channels, 2)):
+                return d
+        return cands[0] if cands else None
 
     @staticmethod
     def _is_bluetooth_device(name: str) -> bool:

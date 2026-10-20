@@ -5,6 +5,7 @@
 采用双通道（独立输入流+输出流）+ 样本级环形缓冲区方案，
 支持输入输出采样率不同的场景（如蓝牙麦克风16kHz -> 扬声器48kHz）。
 """
+import os
 import numpy as np
 import sounddevice as sd
 import threading
@@ -15,6 +16,7 @@ from scipy import signal as scipy_signal
 
 from audio_router.services.howling_suppressor_v2 import (
     TrueFrequencyShifter, MultiCriteriaHowlingSuppressor)
+from audio_router.services.recorder import WavRecorder, default_recordings_dir
 
 from ..models.audio_device import AudioDeviceInfo
 
@@ -125,6 +127,13 @@ class AudioRouterEngine:
 
         # 输出端的原始目标信号副本（供检测分析参考）
         self._last_target: Optional[np.ndarray] = None
+
+        # ---- 本地录音 ----
+        # 开关随路由会话自动启停；也可在运行中随时开关（set_recording_enabled）
+        self._record_enabled: bool = False
+        self._record_dir: str = default_recordings_dir()
+        self._recorder: Optional[WavRecorder] = None
+        self._last_recording_path: Optional[str] = None
 
     # ---------- 配置方法 ----------
 
@@ -283,6 +292,98 @@ class AudioRouterEngine:
         if self._notch_filter:
             return list(self._notch_filter.active_freqs)
         return []
+
+    # ---------- 本地录音控制 ----------
+
+    def set_recording_enabled(self, enabled: bool):
+        """开启/关闭「录音到本地」。
+
+        运行中调用会立即开始或结束录音，无需重启路由 ——
+        用户在会议中途才想起来要录，这个体验很重要。
+        """
+        enabled = bool(enabled)
+        if enabled == self._record_enabled:
+            return
+        self._record_enabled = enabled
+        if self._is_running:
+            if enabled:
+                self._start_recording()
+            else:
+                self._stop_recording()
+
+    def is_recording_enabled(self) -> bool:
+        return self._record_enabled
+
+    def set_recording_dir(self, path: str):
+        """设置录音目录（运行中修改只影响下一次录音）"""
+        if path:
+            self._record_dir = path
+
+    def get_recording_dir(self) -> str:
+        return self._record_dir
+
+    @property
+    def is_recording(self) -> bool:
+        return self._recorder is not None
+
+    @property
+    def recording_path(self) -> Optional[str]:
+        """正在录制的文件路径（未录音时为 None）"""
+        return self._recorder.path if self._recorder else None
+
+    @property
+    def last_recording_path(self) -> Optional[str]:
+        """最近一次录音文件路径（停止后仍保留，供 UI 提示）"""
+        return self._last_recording_path
+
+    @property
+    def recording_seconds(self) -> float:
+        return self._recorder.elapsed if self._recorder else 0.0
+
+    @property
+    def recording_size(self) -> int:
+        return self._recorder.file_size if self._recorder else 0
+
+    @property
+    def recording_dropped(self) -> int:
+        return self._recorder.dropped if self._recorder else 0
+
+    def _start_recording(self):
+        """按当前输入采样率/声道数开一个新的 WAV。
+
+        录音失败（目录无权限/磁盘满）绝不能影响音频路由，
+        所以这里吞掉异常并通过错误回调告知 UI。
+        """
+        if self._recorder is not None:
+            return
+        try:
+            rec = WavRecorder(
+                directory=self._record_dir,
+                samplerate=self._input_samplerate,
+                channels=self._input_channels,
+                on_error=self._notify_error,
+            )
+            path = rec.start()
+            self._recorder = rec
+            self._last_recording_path = path
+        except Exception as e:
+            self._recorder = None
+            self._notify_error(f"无法开始录音：{type(e).__name__}: {e}")
+
+    def _stop_recording(self):
+        """结束录音并关闭文件（会等待写盘线程把队列刷完）"""
+        rec = self._recorder
+        self._recorder = None
+        if rec is None:
+            return
+        try:
+            path = rec.stop()
+            if path:
+                self._last_recording_path = path
+        except Exception:
+            pass
+
+
 
     def set_block_size(self, size: int):
         """设置块大小（延迟控制）"""
@@ -527,12 +628,20 @@ class AudioRouterEngine:
         self._is_running = True
         self._notify_status("started")
 
+        # 路由起来之后才开录音：此时采样率/声道数已最终确定
+        if self._record_enabled:
+            self._start_recording()
+
     def stop(self):
         """停止音频路由"""
         if not self._is_running:
+            # 极端情况：流已停但录音线程还在（例如启动中途异常），也要收尾
+            self._stop_recording()
             return
         self._is_running = False
         self._cleanup_streams()
+        # 关键：先停流再停录音，顺序反了会漏掉最后几块音频
+        self._stop_recording()
         self._buffer = None
         self._input_level = 0.0
         self._output_level = 0.0
@@ -805,6 +914,12 @@ class AudioRouterEngine:
 
             # 6. 计算最终输入电平（用于UI显示）
             self._input_level = float(np.sqrt(np.mean(indata ** 2)))
+
+            # 6.5 本地录音：先入队（不阻塞、不写盘），由独立线程落盘。
+            #     录的是「增益 / 噪声门之后、送往扬声器的那一路」，
+            #     不含输出端的移频与陷波 —— 那是给回授用的，录进文件只会让声音变怪。
+            if self._recorder is not None:
+                self._recorder.feed(indata)
 
             # 单声道转多声道
             if self._input_channels == 1 and self._output_channels > 1:

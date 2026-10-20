@@ -8,7 +8,8 @@
   ├ 实时监测：输入/输出渐变电平条 + 延迟/缓冲/丢失统计
   ├ 防啸叫 · 回音消除：移频 / 自适应陷波 / 噪声门（开关+滑杆）
   ├ 音量：麦克风增益 / 扬声器音量（设计稿未画，功能保留故收紧为一小块）
-  └ 底栏：滚动提示 · WASAPI v2.0
+  ├ 本地录音：录音到本地开关 + 保存目录 + 实时时长/大小
+  └ 底栏：滚动提示 · WASAPI v2.1
 
 交互控件（开关/滑杆/电平条）为自绘 Canvas 部件，
 以贴近设计稿的圆角、配色与手感。
@@ -376,6 +377,9 @@ class MainWindow:
         # 音量（设计稿未画，功能保留，收紧为一小块）
         self._build_volume_panel(main)
 
+        # 本地录音（新增功能）
+        self._build_recording_panel(main)
+
         # ---- 固定底栏 ----
         self._build_footer()
 
@@ -741,6 +745,69 @@ class MainWindow:
                  bg=COLOR_PANEL, fg=COLOR_TEXT_3,
                  font=(FONT, 8), anchor=tk.W).pack(fill=tk.X, pady=(8, 0))
 
+    def _build_recording_panel(self, parent):
+        """本地录音面板：开关 + 保存目录 + 实时时长/大小
+
+        录音独立于防啸叫：录的是「增益/噪声门之后、送往扬声器的那一路」，
+        不含输出端的移频与陷波（那两道是给回授用的，录进文件只会让声音变怪）。
+        """
+        panel = RoundedPanel(parent, radius=14, pad=14)
+        panel.pack(fill=tk.X, pady=(12, 0))
+        inner = panel.inner
+
+        head = tk.Frame(inner, bg=COLOR_PANEL)
+        head.pack(fill=tk.X)
+        tk.Label(head, text="🎙 本地录音", bg=COLOR_PANEL, fg=COLOR_TEXT,
+                 font=(FONT, 10, "bold")).pack(side=tk.LEFT)
+
+        # 右上角录音状态胶囊
+        self.rec_status_label = tk.Label(head, text="未录音", bg=COLOR_PILL,
+                                         fg=COLOR_TEXT_3,
+                                         font=(FONT, 8, "bold"),
+                                         padx=10, pady=3)
+        self.rec_status_label.pack(side=tk.RIGHT)
+
+        # 开关 + 标题说明
+        row = tk.Frame(inner, bg=COLOR_PANEL)
+        row.pack(fill=tk.X, pady=(10, 0))
+        self.record_var = tk.BooleanVar(
+            value=bool(self._prefs.get("record_to_local", False)))
+        self.record_toggle = ToggleSwitch(row, self.record_var,
+                                          command=self._on_record_toggle)
+        self.record_toggle.pack(side=tk.LEFT)
+
+        col = tk.Frame(row, bg=COLOR_PANEL)
+        col.pack(side=tk.LEFT, padx=(10, 0))
+        tk.Label(col, text="录音到本地", bg=COLOR_PANEL, fg=COLOR_TEXT,
+                 font=(FONT, 10, "bold"), anchor=tk.W).pack(anchor=tk.W)
+        tk.Label(col, text="开始路由时自动把麦克风声音存成 WAV",
+                 bg=COLOR_PANEL, fg=COLOR_TEXT_3,
+                 font=(FONT, 8), anchor=tk.W).pack(anchor=tk.W)
+
+        # 保存目录 + 打开文件夹
+        dir_row = tk.Frame(inner, bg=COLOR_PANEL)
+        dir_row.pack(fill=tk.X, pady=(10, 0))
+        self.rec_dir_label = tk.Label(
+            dir_row, text=self.engine.get_recording_dir(),
+            bg=COLOR_PANEL, fg=COLOR_TEXT_3, font=(MONO, 8),
+            anchor=tk.W, justify=tk.LEFT)
+        self.rec_dir_label.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        open_btn = tk.Button(dir_row, text="打开文件夹",
+                             command=self._open_record_folder,
+                             bg=COLOR_PILL, fg=COLOR_TEXT_2,
+                             font=(FONT, 8), bd=0, padx=10, pady=3,
+                             cursor="hand2", relief=tk.FLAT,
+                             activebackground=COLOR_BORDER,
+                             activeforeground=COLOR_TEXT)
+        open_btn.pack(side=tk.RIGHT, padx=(8, 0))
+
+        # 状态详情（时长 / 大小 / 最近文件）
+        self.rec_detail_label = tk.Label(
+            inner, text="未录音 —— 打开开关后，开始路由即自动录制",
+            bg=COLOR_PANEL, fg=COLOR_TEXT_3, font=(FONT, 8), anchor=tk.W)
+        self.rec_detail_label.pack(fill=tk.X, pady=(8, 0))
+
     def _build_footer(self):
         """固定底栏：左滚动提示 / 右版本"""
         footer = tk.Frame(self.root, bg=COLOR_PAGE)
@@ -749,7 +816,7 @@ class MainWindow:
         tk.Label(footer, text="🖱 滚动 · 滚轮 / PgUp / PgDn / Home / End",
                  bg=COLOR_PAGE, fg=COLOR_TEXT_3,
                  font=(FONT, 8), anchor=tk.W).pack(side=tk.LEFT)
-        tk.Label(footer, text="WASAPI · v2.0",
+        tk.Label(footer, text="WASAPI · v2.1",
                  bg=COLOR_PAGE, fg=COLOR_TEXT_3,
                  font=(FONT, 8), anchor=tk.E).pack(side=tk.RIGHT)
 
@@ -822,7 +889,7 @@ class MainWindow:
         self.freq_shift_slider.set_enabled(self.freq_shift_var.get())
         self.gate_threshold_slider.set_enabled(self.noise_gate_var.get())
         self.notch_slider.set_enabled(self.notch_var.get())
-        for t in (self.follow_toggle,):
+        for t in (self.follow_toggle, self.record_toggle):
             t.refresh()
 
         self.engine.set_input_gain(self.input_gain_var.get() / 100.0)
@@ -832,6 +899,13 @@ class MainWindow:
         self.engine.set_noise_gate_enabled(self.noise_gate_var.get())
         self.engine.set_notch_enabled(self.notch_var.get())
         self.engine.set_notch_attenuation_db(self.notch_attenuation_var.get())
+
+        # 录音：恢复上次的开关与目录（目录改动只在下次启动录音时生效）
+        rec_dir = self._prefs.get("record_dir")
+        if rec_dir:
+            self.engine.set_recording_dir(rec_dir)
+        self.engine.set_recording_enabled(self.record_var.get())
+        self._update_recording_ui()
 
     # ---------- 设备管理 ----------
 
@@ -1103,11 +1177,21 @@ class MainWindow:
         return {}
 
     def _update_prefs(self, **kwargs):
+        """原子写入偏好：先写临时文件再 os.replace。
+
+        直接 open(file, "w") 会先截断旧文件 —— 如果进程恰好在写入中途
+        崩溃/被杀/断电，就会留下一个 0 字节的偏好文件（实测踩过）。
+        os.replace 在 Windows 同卷上是原子操作，最坏情况也只是保留旧文件。
+        """
         try:
             prefs = self._load_prefs()
             prefs.update(kwargs)
-            with open(self._pref_file(), "w", encoding="utf-8") as f:
+            tmp = self._pref_file() + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(prefs, f, ensure_ascii=False, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, self._pref_file())
             self._prefs = prefs
         except Exception:
             pass  # 偏好保存失败不影响主流程
@@ -1213,6 +1297,59 @@ class MainWindow:
         self.notch_attenuation_label.config(text=f"{int(val)} dB")
         self.engine.set_notch_attenuation_db(val)
 
+    # ---------- 本地录音 ----------
+
+    def _on_record_toggle(self):
+        """开关拨动：记住偏好；运行中会立即开始/结束录音"""
+        enabled = bool(self.record_var.get())
+        self._update_prefs(record_to_local=enabled)
+        self.engine.set_recording_enabled(enabled)
+        self._update_recording_ui()
+
+    def _open_record_folder(self):
+        """在资源管理器中打开录音目录"""
+        path = self.engine.get_recording_dir()
+        try:
+            os.makedirs(path, exist_ok=True)
+            os.startfile(path)  # 仅 Windows
+        except Exception as e:
+            messagebox.showwarning("提示", f"无法打开文件夹：\n{path}\n\n{e}")
+
+    def _update_recording_ui(self):
+        """刷新录音状态胶囊与详情行（录音中约 3Hz 调用）"""
+        if not hasattr(self, "rec_status_label"):
+            return
+
+        if self.engine.is_recording:
+            secs = int(self.engine.recording_seconds)
+            h, rem = divmod(secs, 3600)
+            m, s = divmod(rem, 60)
+            dur = f"{h}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+            size_mb = self.engine.recording_size / 1048576.0
+            text = f"● 录制中  {dur}  ·  {size_mb:.1f} MB"
+            dropped = self.engine.recording_dropped
+            if dropped:
+                text += f"  ·  丢帧 {dropped}"
+            self.rec_status_label.config(text="● REC", fg=COLOR_RED,
+                                         bg="#2a1414")
+            self.rec_detail_label.config(text=text, fg=COLOR_GREEN)
+        else:
+            self.rec_status_label.config(text="未录音", fg=COLOR_TEXT_3,
+                                         bg=COLOR_PILL)
+            last = self.engine.last_recording_path
+            if last and os.path.exists(last):
+                try:
+                    mb = os.path.getsize(last) / 1048576.0
+                except Exception:
+                    mb = 0.0
+                self.rec_detail_label.config(
+                    text=f"最近：{os.path.basename(last)}（{mb:.1f} MB）",
+                    fg=COLOR_TEXT_3)
+            else:
+                self.rec_detail_label.config(
+                    text="未录音 —— 打开开关后，开始路由即自动录制",
+                    fg=COLOR_TEXT_3)
+
     # ---------- 路由控制 ----------
 
     def _toggle_router(self):
@@ -1295,6 +1432,7 @@ class MainWindow:
         self.notch_freq_label.config(text="当前陷波: 无", fg=COLOR_TEXT_3)
         self.gate_status_label.config(text="抑制门 · 关闭", fg=COLOR_TEXT_3,
                                       bg=COLOR_PILL)
+        self._update_recording_ui()
 
     # ---------- 引擎回调 ----------
 
@@ -1370,6 +1508,11 @@ class MainWindow:
 
             # 当前陷波频率
             self._update_notch_freq_display()
+
+        # 录音状态：约 3Hz 刷新即可（每 10 帧 ≈ 300ms）
+        self._rec_ui_tick = getattr(self, "_rec_ui_tick", 0) + 1
+        if self._rec_ui_tick % 10 == 0:
+            self._update_recording_ui()
 
         self.root.after(30, self._update_ui)
 

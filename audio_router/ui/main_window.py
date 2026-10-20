@@ -771,7 +771,7 @@ class MainWindow:
         row = tk.Frame(inner, bg=COLOR_PANEL)
         row.pack(fill=tk.X, pady=(10, 0))
         self.record_var = tk.BooleanVar(
-            value=bool(self._prefs.get("record_to_local", False)))
+            value=bool(self._prefs.get("record_to_local", True)))
         self.record_toggle = ToggleSwitch(row, self.record_var,
                                           command=self._on_record_toggle)
         self.record_toggle.pack(side=tk.LEFT)
@@ -804,7 +804,7 @@ class MainWindow:
 
         # 状态详情（时长 / 大小 / 最近文件）
         self.rec_detail_label = tk.Label(
-            inner, text="未录音 —— 打开开关后，开始路由即自动录制",
+            inner, text="待路由 —— 点击「开始路由」后自动录制",
             bg=COLOR_PANEL, fg=COLOR_TEXT_3, font=(FONT, 8), anchor=tk.W)
         self.rec_detail_label.pack(fill=tk.X, pady=(8, 0))
 
@@ -1347,7 +1347,9 @@ class MainWindow:
                     fg=COLOR_TEXT_3)
             else:
                 self.rec_detail_label.config(
-                    text="未录音 —— 打开开关后，开始路由即自动录制",
+                    text=("待路由 —— 点击「开始路由」后自动录制"
+                          if self.record_var.get()
+                          else "已关闭 —— 打开开关后，开始路由即自动录制"),
                     fg=COLOR_TEXT_3)
 
     # ---------- 路由控制 ----------

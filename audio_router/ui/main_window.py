@@ -14,6 +14,7 @@
 交互控件（开关/滑杆/电平条）为自绘 Canvas 部件，
 以贴近设计稿的圆角、配色与手感。
 """
+import json
 import math
 import os
 import threading
@@ -1020,16 +1021,37 @@ class MainWindow:
                 return
 
         # ---- 1) 输入设备 ----
-        in_candidates = []
+        # 1a) 刷新时保留用户当前选择：否则「系统默认」会被蓝牙 HFP 麦克风
+        #     顶掉（1 声道 / 16 kHz），用户手动选的插孔麦会莫名其妙失效。
+        picked = False
         if user_action:
+            cur = self.input_combo.current()
+            if 0 <= cur < len(self._input_devices):
+                self._on_input_selected(None)
+                picked = True
+
+        # 1b) 启动时恢复上次手动选择的输入设备（与输出偏好一致）
+        if not picked and not user_action:
+            pref = self._load_preferred_input()
+            if pref:
+                pref_name, pref_api = pref
+                for i, d in enumerate(self._input_devices):
+                    if d.name == pref_name and (not pref_api or d.hostapi_name == pref_api):
+                        self.input_combo.current(i)
+                        self._on_input_selected(None)
+                        picked = True
+                        break
+
+        in_candidates = []
+        if user_action and not picked:
             sd_in = DeviceManager.find_system_default_input()
             if sd_in:
                 in_candidates.append(sd_in.index)
-        bt_input = DeviceManager.find_bluetooth_input()
-        if bt_input:
-            in_candidates.append(bt_input.index)
+        if not picked:
+            bt_input = DeviceManager.find_bluetooth_input()
+            if bt_input:
+                in_candidates.append(bt_input.index)
 
-        picked = False
         for want in in_candidates:
             for i, d in enumerate(self._input_devices):
                 if d.index == want:
@@ -1115,6 +1137,11 @@ class MainWindow:
         self.input_meta_label.config(
             text=f"CH {device.max_input_channels} · {picked / 1000:.1f} kHz · {api_name}")
 
+        # 只有用户手动选择才记入偏好，避免自动选择覆盖掉用户意图
+        if event is not None:
+            self._update_prefs(input_name=device.name,
+                               input_hostapi=device.hostapi_name)
+
     def _on_output_selected(self, event):
         """输出设备选中：更新设备名 / 徽章 / 元信息 / 绿色横幅"""
         idx = self.output_combo.current()
@@ -1199,6 +1226,12 @@ class MainWindow:
     def _save_preferred_output(self, device):
         self._update_prefs(output_name=device.name,
                            output_hostapi=device.hostapi_name)
+
+    def _load_preferred_input(self):
+        name = self._prefs.get("input_name")
+        if name:
+            return name, self._prefs.get("input_hostapi", "")
+        return None
 
     def _load_preferred_output(self):
         name = self._prefs.get("output_name")
